@@ -40,6 +40,19 @@ fn next_timeline_clip_id() -> String {
     )
 }
 
+fn record_clip_history(
+    undo: &Rc<RefCell<Vec<Vec<Clip>>>>,
+    redo: &Rc<RefCell<Vec<Vec<Clip>>>>,
+    snapshot: Vec<Clip>,
+) {
+    let mut undo = undo.borrow_mut();
+    if undo.len() >= 100 {
+        undo.remove(0);
+    }
+    undo.push(snapshot);
+    redo.borrow_mut().clear();
+}
+
 struct ImportedClip {
     name: String,
     path: String,
@@ -48,6 +61,32 @@ struct ImportedClip {
     track: i32,
     thumbnails: [Option<std::path::PathBuf>; 3],
     waveform: Option<PathBuf>,
+}
+
+struct QueuedExport {
+    clips: Vec<render::RenderClip>,
+    output_path: PathBuf,
+    width: u32,
+    height: u32,
+    quality: String,
+    options: render::ExportRenderOptions,
+}
+
+fn export_queue_labels(
+    queue: &Arc<Mutex<std::collections::VecDeque<QueuedExport>>>,
+) -> Vec<slint::SharedString> {
+    queue
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .map(|job| {
+            job.output_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("output.mp4")
+                .into()
+        })
+        .collect()
 }
 
 struct EditorRuntimeState {
@@ -205,6 +244,9 @@ fn render_snapshot_signature(clips: &[render::RenderClip]) -> u64 {
             clip.sharpen,
             clip.fade_in,
             clip.fade_out,
+            clip.scale,
+            clip.rotation,
+            clip.scale_end,
         ] {
             value.to_bits().hash(&mut hasher);
         }
@@ -212,6 +254,10 @@ fn render_snapshot_signature(clips: &[render::RenderClip]) -> u64 {
         clip.track_muted.hash(&mut hasher);
         clip.track_solo.hash(&mut hasher);
         clip.solo_mode.hash(&mut hasher);
+        clip.animate_scale.hash(&mut hasher);
+        clip.title_text.hash(&mut hasher);
+        clip.opacity.to_bits().hash(&mut hasher);
+        clip.sharpen.to_bits().hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -299,7 +345,7 @@ fn apply_clip_preview_settings(
 ) {
     let _ = player
         .engine
-        .set_property("brightness", clip.exposure as f64);
+        .set_property("brightness", (clip.exposure / 100.0) as f64);
     let _ = player
         .engine
         .set_property("contrast", ((clip.contrast - 1.0) * 100.0) as f64);
@@ -562,6 +608,114 @@ fn save_project_bundle(
     Ok(())
 }
 
+/// A lightweight crash-recovery snapshot. It stores the edit manifest and
+/// original media paths, not copies of large source files. The normal Save
+/// command remains a portable, media-embedded project bundle.
+fn save_autosave_bundle(
+    path: &Path,
+    project_name: &str,
+    clips: &[ProjectClipData],
+    assets: &[ProjectMediaData],
+    bins: &[String],
+    tracks: &[AudioTrackSettings; 4],
+) -> std::io::Result<()> {
+    if assets
+        .iter()
+        .any(|asset| !Path::new(&asset.source_path).is_file())
+        || clips
+            .iter()
+            .any(|clip| !Path::new(&clip.source_path).is_file())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Autosave skipped because one or more source media files are unavailable",
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("autosave.vpproj");
+    let temporary = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+    let _temporary_cleanup = TemporaryFile(temporary.clone());
+    let file = fs::File::create(&temporary)?;
+    let mut archive = ZipWriter::new(file);
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let mut manifest = format!("VIDEOPRO_BUNDLE\t9\nNAME\t{}\n", encode_name(project_name));
+    for (index, track) in tracks.iter().enumerate() {
+        manifest.push_str(&format!(
+            "TRACK\t{index}\t{:.6}\t{}\t{}\n",
+            track.gain_db,
+            u8::from(track.muted),
+            u8::from(track.solo)
+        ));
+    }
+    for bin in bins {
+        if bin != "All Media" && bin != "Unsorted" {
+            manifest.push_str(&format!("BIN\t{}\n", encode_name(bin)));
+        }
+    }
+    for (index, asset) in assets.iter().enumerate() {
+        let external = format!(
+            "media/external-asset-{index:06}{}",
+            safe_extension(Path::new(&asset.source_path))
+        );
+        manifest.push_str(&format!(
+            "ASSET\t{}\t{}\t{}\t{:.6}\t{}\n",
+            encode_name(&asset.name),
+            encode_name(&asset.source_path),
+            encode_name(&external),
+            asset.duration_seconds,
+            encode_name(&asset.bin)
+        ));
+    }
+    for (index, clip) in clips.iter().enumerate() {
+        let external = format!(
+            "media/external-clip-{index:06}{}",
+            safe_extension(Path::new(&clip.source_path))
+        );
+        manifest.push_str(&format!(
+            "CLIP\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{}\t{:.6}\n",
+            encode_name(&clip.name), encode_name(&clip.source_path), encode_name(&external),
+            clip.duration_seconds, clip.start_seconds, clip.source_in_seconds, clip.source_out_seconds,
+            clip.track, clip.exposure, clip.contrast, clip.saturation, clip.opacity,
+            clip.transition_in_seconds, clip.transition_out_seconds, clip.audio_gain_db,
+            clip.blur, clip.sharpen, encode_name(&clip.title_text), clip.scale, clip.rotation,
+            u8::from(clip.animate_scale), clip.scale_end,
+        ));
+    }
+    archive.start_file("project.vpm", stored)?;
+    archive.write_all(manifest.as_bytes())?;
+    let file = archive.finish()?;
+    file.sync_all()?;
+    drop(file);
+    if path.exists() {
+        let backup = path.with_extension("vpproj.bak");
+        if backup.exists() {
+            fs::remove_file(&backup)?;
+        }
+        fs::rename(path, &backup)?;
+        match fs::rename(&temporary, path) {
+            Ok(()) => {
+                let _ = fs::remove_file(backup);
+            }
+            Err(error) => {
+                let _ = fs::rename(&backup, path);
+                return Err(error);
+            }
+        }
+    } else {
+        fs::rename(temporary, path)?;
+    }
+    Ok(())
+}
+
+fn autosave_path() -> Option<PathBuf> {
+    Some(project_storage_dir()?.join("Autosave/last-session.vpproj"))
+}
+
 fn resolve_project_source(path: &Path) -> Result<PathBuf, String> {
     if path.is_file() {
         return Ok(path.to_path_buf());
@@ -642,6 +796,7 @@ fn load_project_bundle_into(
         Some("VIDEOPRO_BUNDLE\t6") => 6,
         Some("VIDEOPRO_BUNDLE\t7") => 7,
         Some("VIDEOPRO_BUNDLE\t8") => 8,
+        Some("VIDEOPRO_BUNDLE\t9") => 9,
         _ => return Err("Unsupported VideoPro project version".to_owned()),
     };
     let project_name = lines
@@ -964,10 +1119,11 @@ fn load_project_bundle_into(
                     }
                     Err(_)
                         if Path::new(&original_path).is_file()
-                            && Path::new(&original_path).file_name()
-                                == Path::new(&name).file_name()
-                            && safe_extension(Path::new(&original_path))
-                                == safe_extension(Path::new(&archive_path)) =>
+                            && (version >= 9
+                                || (Path::new(&original_path).file_name()
+                                    == Path::new(&name).file_name()
+                                    && safe_extension(Path::new(&original_path))
+                                        == safe_extension(Path::new(&archive_path)))) =>
                     {
                         // If an archive entry was lost during an interrupted/corrupt
                         // copy, recover from the original source when it still exists.
@@ -1257,6 +1413,10 @@ fn configure_editor(
     let undo_stack = Rc::new(RefCell::new(Vec::<Vec<Clip>>::new()));
     let redo_stack = Rc::new(RefCell::new(Vec::<Vec<Clip>>::new()));
     let drag_snapshot = Rc::new(RefCell::new(None::<Vec<Clip>>));
+    let last_clip_edit = Rc::new(RefCell::new(None::<(Instant, String)>));
+    let export_queue = Arc::new(Mutex::new(std::collections::VecDeque::<QueuedExport>::new()));
+    let export_worker_running = Arc::new(AtomicBool::new(false));
+    let export_paths = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
     let project_generation = Arc::new(AtomicU64::new(0));
     let project_reset_requested = Arc::new(AtomicBool::new(false));
 
@@ -1275,6 +1435,9 @@ fn configure_editor(
         let audio_generation = Arc::clone(&audio_generation);
         move || {
             if let Some(ui) = weak.upgrade() {
+                if let Some(path) = autosave_path() {
+                    let _ = fs::remove_file(path);
+                }
                 generation.fetch_add(1, Ordering::AcqRel);
                 pending_seek.set(None);
                 pending_local.set(None);
@@ -1391,6 +1554,9 @@ fn configure_editor(
                         match result {
                             Ok(()) => {
                                 remember_recent_project(&path, &project_name);
+                                if let Some(autosave) = autosave_path() {
+                                    let _ = fs::remove_file(autosave);
+                                }
                                 ui.set_status_message(
                                     format!(
                                         "Project bundle saved: {}",
@@ -1408,6 +1574,24 @@ fn configure_editor(
                     }
                 });
             });
+        }
+    });
+
+    editor.on_recover_autosave({
+        let weak = editor.as_weak();
+        move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(path) = autosave_path().filter(|path| path.is_file()) else {
+                ui.set_status_message("No autosave recovery snapshot exists yet".into());
+                return;
+            };
+            if let Ok(mut pending) = PENDING_PROJECT_PATH.lock() {
+                *pending = Some(path);
+                drop(pending);
+                ui.invoke_open_project();
+            } else {
+                ui.set_status_message("Could not prepare autosave recovery".into());
+            }
         }
     });
 
@@ -1529,6 +1713,9 @@ fn configure_editor(
                     else {
                         return;
                     };
+                    if let Some(autosave) = autosave_path() {
+                        let _ = fs::remove_file(autosave);
+                    }
                     let mut clips = Vec::with_capacity(imported.len());
                     let mut end = 10.0_f32;
                     for (
@@ -2082,6 +2269,7 @@ fn configure_editor(
         let player = Rc::clone(&player);
         let undo = Rc::clone(&undo_stack);
         let redo = Rc::clone(&redo_stack);
+        let last_edit = Rc::clone(&last_clip_edit);
         move || {
             let Some(ui) = weak.upgrade() else {
                 return;
@@ -2154,11 +2342,18 @@ fn configure_editor(
                 return;
             }
             apply_clip_preview_settings(&player, &clips[index], &audio_track_settings(&ui));
-            undo.borrow_mut().push(ui.get_clips().iter().collect());
-            if undo.borrow().len() > 100 {
-                undo.borrow_mut().remove(0);
+            let should_record = {
+                let now = Instant::now();
+                let mut last = last_edit.borrow_mut();
+                let coalesce = last.as_ref().is_some_and(|(at, id)| {
+                    id == &selected && now.duration_since(*at) < Duration::from_millis(500)
+                });
+                *last = Some((now, selected.clone()));
+                !coalesce
+            };
+            if should_record {
+                record_clip_history(&undo, &redo, ui.get_clips().iter().collect());
             }
-            redo.borrow_mut().clear();
             let mut start = 0.0_f32;
             for clip in &clips {
                 start = start.max(clip.start_seconds + clip.duration_seconds);
@@ -2193,6 +2388,7 @@ fn configure_editor(
         let player = Rc::clone(&player);
         let undo = Rc::clone(&undo_stack);
         let redo = Rc::clone(&redo_stack);
+        let last_edit = Rc::clone(&last_clip_edit);
         move || {
             let Some(ui) = weak.upgrade() else {
                 return;
@@ -2201,7 +2397,14 @@ fn configure_editor(
                 ui.set_status_message("Nothing to undo".into());
                 return;
             };
-            redo.borrow_mut().push(ui.get_clips().iter().collect());
+            *last_edit.borrow_mut() = None;
+            {
+                let mut redo = redo.borrow_mut();
+                if redo.len() >= 100 {
+                    redo.remove(0);
+                }
+                redo.push(ui.get_clips().iter().collect());
+            }
             let end = previous
                 .iter()
                 .map(|clip| clip.start_seconds + clip.duration_seconds)
@@ -2226,6 +2429,11 @@ fn configure_editor(
                 ui.set_edit_sharpen(clip.sharpen);
                 ui.set_edit_transition_in(clip.transition_in_seconds);
                 ui.set_edit_transition_out(clip.transition_out_seconds);
+                ui.set_edit_title_text(clip.title_text.to_string().into());
+                ui.set_edit_scale(clip.scale);
+                ui.set_edit_rotation(clip.rotation);
+                ui.set_edit_animate_scale(clip.animate_scale);
+                ui.set_edit_scale_end(clip.scale_end);
             }
             ui.set_status_message("Undo".into());
         }
@@ -2236,6 +2444,7 @@ fn configure_editor(
         let player = Rc::clone(&player);
         let undo = Rc::clone(&undo_stack);
         let redo = Rc::clone(&redo_stack);
+        let last_edit = Rc::clone(&last_clip_edit);
         move || {
             let Some(ui) = weak.upgrade() else {
                 return;
@@ -2244,7 +2453,14 @@ fn configure_editor(
                 ui.set_status_message("Nothing to redo".into());
                 return;
             };
-            undo.borrow_mut().push(ui.get_clips().iter().collect());
+            *last_edit.borrow_mut() = None;
+            {
+                let mut undo = undo.borrow_mut();
+                if undo.len() >= 100 {
+                    undo.remove(0);
+                }
+                undo.push(ui.get_clips().iter().collect());
+            }
             let end = next
                 .iter()
                 .map(|clip| clip.start_seconds + clip.duration_seconds)
@@ -2269,6 +2485,11 @@ fn configure_editor(
                 ui.set_edit_sharpen(clip.sharpen);
                 ui.set_edit_transition_in(clip.transition_in_seconds);
                 ui.set_edit_transition_out(clip.transition_out_seconds);
+                ui.set_edit_title_text(clip.title_text.to_string().into());
+                ui.set_edit_scale(clip.scale);
+                ui.set_edit_rotation(clip.rotation);
+                ui.set_edit_animate_scale(clip.animate_scale);
+                ui.set_edit_scale_end(clip.scale_end);
             }
             ui.set_status_message("Redo".into());
         }
@@ -2517,13 +2738,13 @@ fn configure_editor(
 
     editor.on_export_project({
         let weak = editor.as_weak();
+        let queue = Arc::clone(&export_queue);
+        let worker_running = Arc::clone(&export_worker_running);
+        let queued_paths = Arc::clone(&export_paths);
         move || {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
-            if ui.get_export_in_progress() {
-                return;
-            }
             let Some(output_path) = rfd::FileDialog::new()
                 .set_title("Export VideoPro Timeline")
                 .add_filter("MP4 Video", &["mp4"])
@@ -2549,55 +2770,170 @@ fn configure_editor(
                     _ => None,
                 },
             };
+            {
+                let mut paths = queued_paths
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !paths.insert(output_path.clone()) {
+                    ui.set_status_message("That output path is already queued or rendering".into());
+                    return;
+                }
+            }
+            {
+                let mut pending = queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                pending.push_back(QueuedExport {
+                    clips,
+                    output_path: output_path.clone(),
+                    width: export_width,
+                    height: export_height,
+                    quality: export_quality,
+                    options: export_options,
+                });
+                ui.set_export_queue_count(pending.len() as i32);
+            }
+            ui.set_export_queue_items(
+                Rc::new(slint::VecModel::from(export_queue_labels(&queue))).into(),
+            );
             ui.set_export_progress(0.0);
             ui.set_export_in_progress(true);
-            ui.set_status_message("Rendering timeline to MP4…".into());
-            let weak = ui.as_weak();
+            ui.set_status_message(
+                format!(
+                    "Export queued: {}",
+                    output_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("output.mp4")
+                )
+                .into(),
+            );
             drop(ui);
-            thread::spawn(move || {
-                let progress_weak = weak.clone();
-                let result = render::render_mp4_with_export_options(
-                    &clips,
-                    &output_path,
-                    export_width,
-                    export_height,
-                    &export_quality,
-                    export_options,
-                    move |progress| {
-                        let weak = progress_weak.clone();
+
+            if worker_running
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let queue = Arc::clone(&queue);
+                let worker_running = Arc::clone(&worker_running);
+                let queued_paths = Arc::clone(&queued_paths);
+                let weak = weak.clone();
+                thread::spawn(move || {
+                    loop {
+                        let job = queue
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .pop_front();
+                        let Some(job) = job else {
+                            worker_running.store(false, Ordering::Release);
+                            let has_pending = !queue
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .is_empty();
+                            if has_pending
+                                && worker_running
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok()
+                            {
+                                continue;
+                            }
+                            let weak = weak.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = weak.upgrade() {
+                                    ui.set_export_in_progress(false);
+                                    ui.set_export_queue_count(0);
+                                    ui.set_export_queue_items(
+                                        Rc::new(slint::VecModel::from(
+                                            Vec::<slint::SharedString>::new(),
+                                        ))
+                                        .into(),
+                                    );
+                                    if ui.get_export_progress() >= 1.0 {
+                                        ui.set_status_message("Export queue finished".into());
+                                    }
+                                }
+                            });
+                            break;
+                        };
+
+                        let weak_for_start = weak.clone();
+                        let label = job
+                            .output_path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("output.mp4")
+                            .to_owned();
+                        let start_label = label.clone();
+                        let waiting = queue
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .len() as i32;
+                        let waiting_items = export_queue_labels(&queue);
                         let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = weak.upgrade() {
-                                ui.set_export_progress(progress);
-                                ui.set_status_message(
-                                    format!("Rendering timeline · {:.0}%", progress * 100.0).into(),
+                            if let Some(ui) = weak_for_start.upgrade() {
+                                ui.set_export_progress(0.0);
+                                ui.set_export_queue_count(waiting);
+                                ui.set_export_queue_items(
+                                    Rc::new(slint::VecModel::from(waiting_items)).into(),
                                 );
+                                ui.set_status_message(format!("Rendering {start_label}…").into());
                             }
                         });
-                    },
-                );
-                let (message, succeeded) = match result {
-                    Ok(()) => (
-                        format!(
-                            "Export complete: {}",
-                            output_path
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or("output.mp4")
-                        ),
-                        true,
-                    ),
-                    Err(error) => (format!("Export failed: {error}"), false),
-                };
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = weak.upgrade() {
-                        if succeeded {
-                            ui.set_export_progress(1.0);
-                        }
-                        ui.set_export_in_progress(false);
-                        ui.set_status_message(message.into());
+
+                        let progress_weak = weak.clone();
+                        let result = render::render_mp4_with_export_options(
+                            &job.clips,
+                            &job.output_path,
+                            job.width,
+                            job.height,
+                            &job.quality,
+                            job.options,
+                            move |progress| {
+                                let weak = progress_weak.clone();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if let Some(ui) = weak.upgrade() {
+                                        ui.set_export_progress(progress);
+                                        ui.set_status_message(
+                                            format!("Rendering · {:.0}%", progress * 100.0).into(),
+                                        );
+                                    }
+                                });
+                            },
+                        );
+                        let (message, succeeded) = match result {
+                            Ok(()) => (format!("Export complete: {label}"), true),
+                            Err(error) => (format!("Export failed for {label}: {error}"), false),
+                        };
+                        queued_paths
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&job.output_path);
+                        let weak_for_done = weak.clone();
+                        let waiting = queue
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .len() as i32;
+                        let waiting_items = export_queue_labels(&queue);
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = weak_for_done.upgrade() {
+                                if succeeded {
+                                    ui.set_export_progress(1.0);
+                                }
+                                ui.set_export_queue_count(waiting);
+                                ui.set_export_queue_items(
+                                    Rc::new(slint::VecModel::from(waiting_items)).into(),
+                                );
+                                ui.set_status_message(message.into());
+                            }
+                        });
                     }
                 });
-            });
+            }
         }
     });
 
@@ -2703,6 +3039,138 @@ fn configure_editor(
                 ui.set_right_panel_width(272.0);
                 ui.set_status_message("Layout reset".into());
             }
+        }
+    });
+
+    editor.on_split_selected_clip({
+        let weak = editor.as_weak();
+        let undo = Rc::clone(&undo_stack);
+        let redo = Rc::clone(&redo_stack);
+        move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let selected = ui.get_selected_clip_id().to_string();
+            let mut clips: Vec<Clip> = ui.get_clips().iter().collect();
+            let Some(index) = clips.iter().position(|clip| clip.id == selected) else {
+                ui.set_status_message("Select a timeline clip to split".into());
+                return;
+            };
+            let original = clips[index].clone();
+            let split_at = ui.get_timeline_playhead_seconds();
+            let clip_end = original.start_seconds + original.duration_seconds;
+            if split_at <= original.start_seconds + 0.05 || split_at >= clip_end - 0.05 {
+                ui.set_status_message(
+                    "Move the playhead inside the selected clip to split it".into(),
+                );
+                return;
+            }
+            record_clip_history(&undo, &redo, clips.clone());
+            let left_duration = split_at - original.start_seconds;
+            let right_duration = clip_end - split_at;
+            let source_split = original.source_in_seconds + left_duration;
+            clips[index].duration_seconds = left_duration;
+            clips[index].duration = format_time(left_duration as f64).into();
+            clips[index].source_out_seconds = source_split;
+            let mut right = original;
+            right.id = next_timeline_clip_id().into();
+            right.start_seconds = split_at;
+            right.source_in_seconds = source_split;
+            right.duration_seconds = right_duration;
+            right.duration = format_time(right_duration as f64).into();
+            clips.insert(index + 1, right.clone());
+            ui.set_clips(Rc::new(slint::VecModel::from(clips)).into());
+            ui.set_selected_clip(right.path.clone());
+            ui.set_selected_clip_id(right.id.clone());
+            ui.invoke_select_clip(right.id);
+            ui.set_status_message("Clip split at playhead".into());
+        }
+    });
+
+    editor.on_duplicate_selected_clip({
+        let weak = editor.as_weak();
+        let undo = Rc::clone(&undo_stack);
+        let redo = Rc::clone(&redo_stack);
+        move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let selected = ui.get_selected_clip_id().to_string();
+            let mut clips: Vec<Clip> = ui.get_clips().iter().collect();
+            let Some(original) = clips.iter().find(|clip| clip.id == selected).cloned() else {
+                ui.set_status_message("Select a timeline clip to duplicate".into());
+                return;
+            };
+            record_clip_history(&undo, &redo, clips.clone());
+            let mut duplicate = original.clone();
+            duplicate.id = next_timeline_clip_id().into();
+            duplicate.start_seconds = original.start_seconds + original.duration_seconds;
+            let new_id = duplicate.id.clone();
+            let path = duplicate.path.clone();
+            clips.push(duplicate);
+            let end = clips
+                .iter()
+                .map(|clip| clip.start_seconds + clip.duration_seconds)
+                .fold(10.0_f32, f32::max);
+            ui.set_timeline_duration(end);
+            ui.set_clips(Rc::new(slint::VecModel::from(clips)).into());
+            ui.set_selected_clip(path);
+            ui.set_selected_clip_id(new_id.clone());
+            ui.invoke_select_clip(new_id);
+            ui.set_status_message("Clip duplicated after original".into());
+        }
+    });
+
+    editor.on_ripple_delete_selected_clip({
+        let weak = editor.as_weak();
+        let undo = Rc::clone(&undo_stack);
+        let redo = Rc::clone(&redo_stack);
+        move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let selected = ui.get_selected_clip_id().to_string();
+            let mut clips: Vec<Clip> = ui.get_clips().iter().collect();
+            let Some(removed) = clips.iter().find(|clip| clip.id == selected).cloned() else {
+                ui.set_status_message("Select a timeline clip to ripple-delete".into());
+                return;
+            };
+            record_clip_history(&undo, &redo, clips.clone());
+            let removed_end = removed.start_seconds + removed.duration_seconds;
+            clips.retain(|clip| clip.id != selected);
+            for clip in &mut clips {
+                if clip.track == removed.track && clip.start_seconds >= removed_end - 0.001 {
+                    clip.start_seconds = (clip.start_seconds - removed.duration_seconds).max(0.0);
+                }
+            }
+            let end = clips
+                .iter()
+                .map(|clip| clip.start_seconds + clip.duration_seconds)
+                .fold(10.0_f32, f32::max);
+            ui.set_timeline_duration(end);
+            ui.set_clips(Rc::new(slint::VecModel::from(clips)).into());
+            ui.set_selected_clip("".into());
+            ui.set_selected_clip_id("".into());
+            ui.set_status_message(
+                "Clip removed and following clips rippled left on its track".into(),
+            );
+        }
+    });
+
+    editor.on_nudge_selected_clip({
+        let weak = editor.as_weak();
+        let undo = Rc::clone(&undo_stack);
+        let redo = Rc::clone(&redo_stack);
+        move |direction| {
+            let Some(ui) = weak.upgrade() else { return };
+            let selected = ui.get_selected_clip_id().to_string();
+            let mut clips: Vec<Clip> = ui.get_clips().iter().collect();
+            let Some(index) = clips.iter().position(|clip| clip.id == selected) else {
+                return;
+            };
+            let before = clips[index].start_seconds;
+            let after = (before + direction.clamp(-1, 1) as f32 / 30.0).max(0.0);
+            if (after - before).abs() < 0.0001 {
+                return;
+            }
+            record_clip_history(&undo, &redo, clips.clone());
+            clips[index].start_seconds = after;
+            ui.set_clips(Rc::new(slint::VecModel::from(clips)).into());
+            ui.set_status_message("Clip nudged by one frame".into());
         }
     });
 
@@ -2912,6 +3380,8 @@ fn open_editor(
     let latest_preview_id_for_timer = Arc::clone(&latest_preview_id);
     let meter_busy = Arc::new(AtomicBool::new(false));
     let meter_busy_for_timer = Arc::clone(&meter_busy);
+    let autosave_busy = Arc::new(AtomicBool::new(false));
+    let autosave_busy_for_timer = Arc::clone(&autosave_busy);
 
     let timer = Timer::default();
     let mut last_duration: Option<f64> = None;
@@ -2924,6 +3394,7 @@ fn open_editor(
     let mut last_preview_signature: Option<u64> = None;
     let mut last_audio_signature: Option<u64> = None;
     let mut last_meter_sample: Option<Instant> = None;
+    let mut last_autosave = Instant::now();
     timer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -2956,6 +3427,79 @@ fn open_editor(
             last_selected_path.clear();
             selected_start_cache = 0.0;
             selected_source_in_cache = 0.0;
+        }
+
+        // A lightweight recovery snapshot stores edit metadata and source paths,
+        // not copies of large video/audio files. The portable Save command still
+        // creates a self-contained bundle.
+        if last_autosave.elapsed() >= Duration::from_secs(15) {
+            last_autosave = Instant::now();
+            let clips: Vec<ProjectClipData> = ui
+                .get_clips()
+                .iter()
+                .map(|clip| ProjectClipData {
+                    name: clip.name.to_string(),
+                    title_text: clip.title_text.to_string(),
+                    source_path: clip.path.to_string(),
+                    duration_seconds: clip.duration_seconds,
+                    start_seconds: clip.start_seconds,
+                    source_in_seconds: clip.source_in_seconds,
+                    source_out_seconds: clip.source_out_seconds,
+                    track: clip.track,
+                    exposure: clip.exposure,
+                    contrast: clip.contrast,
+                    saturation: clip.saturation,
+                    opacity: clip.opacity,
+                    audio_gain_db: clip.audio_gain_db,
+                    blur: clip.blur,
+                    sharpen: clip.sharpen,
+                    transition_in_seconds: clip.transition_in_seconds,
+                    transition_out_seconds: clip.transition_out_seconds,
+                    scale: clip.scale,
+                    rotation: clip.rotation,
+                    animate_scale: clip.animate_scale,
+                    scale_end: clip.scale_end,
+                })
+                .collect();
+            let assets: Vec<ProjectMediaData> = ui
+                .get_media_assets()
+                .iter()
+                .map(|asset| ProjectMediaData {
+                    name: asset.name.to_string(),
+                    source_path: asset.path.to_string(),
+                    duration_seconds: asset.duration_seconds,
+                    bin: asset.bin.to_string(),
+                })
+                .collect();
+            if (!clips.is_empty() || !assets.is_empty())
+                && autosave_busy_for_timer
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                && let Some(path) = autosave_path()
+            {
+                let project_name = ui.get_project_name().to_string();
+                let bins: Vec<String> = ui
+                    .get_media_bins()
+                    .iter()
+                    .map(|bin| bin.to_string())
+                    .collect();
+                let tracks = audio_track_settings(&ui);
+                let weak = ui.as_weak();
+                let busy = Arc::clone(&autosave_busy_for_timer);
+                thread::spawn(move || {
+                    let result =
+                        save_autosave_bundle(&path, &project_name, &clips, &assets, &bins, &tracks);
+                    busy.store(false, Ordering::Release);
+                    if let Err(error) = result {
+                        let message = format!("Autosave recovery snapshot failed: {error}");
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = weak.upgrade() {
+                                ui.set_status_message(message.into());
+                            }
+                        });
+                    }
+                });
+            }
         }
 
         // mpv event pumping and property queries are unnecessary while the
@@ -3765,6 +4309,33 @@ mod tests {
             fs::read(&loaded_clips[0].source_path).expect("read extracted media"),
             b"fake-media-payload"
         );
+
+        let autosave_path = directory.join("recovery.vpproj");
+        save_autosave_bundle(
+            &autosave_path,
+            "Test Project Recovery",
+            &clips,
+            &assets,
+            &bins,
+            &tracks,
+        )
+        .expect("write lightweight recovery snapshot");
+        let autosave_file = fs::File::open(&autosave_path).expect("open recovery snapshot");
+        let autosave_archive = ZipArchive::new(autosave_file).expect("recovery snapshot is ZIP");
+        assert_eq!(
+            autosave_archive.len(),
+            1,
+            "autosave must not embed media payloads"
+        );
+        drop(autosave_archive);
+        let (recovered_name, recovered_clips, recovered_assets, recovered_bins, recovered_tracks) =
+            load_project_bundle_into(&autosave_path, &directory.join("recovered"))
+                .expect("recover autosave snapshot using source paths");
+        assert_eq!(recovered_name, "Test Project Recovery");
+        assert_eq!(recovered_clips.len(), 2);
+        assert_eq!(recovered_assets.len(), 1);
+        assert!(recovered_bins.contains(&"Empty Bin".to_owned()));
+        assert_eq!(recovered_tracks[1].gain_db, -4.5);
 
         let _ = fs::remove_dir_all(directory);
     }

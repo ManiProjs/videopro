@@ -428,8 +428,8 @@ component ParamSlider inherits VerticalLayout {
 export component EditorWindow inherits Window {
     title: "VideoPro — Editor";
     no-frame: !root.is-macos;
-    min-width: 1440px;
-    min-height: 920px;
+    min-width: 1080px;
+    min-height: 720px;
     default-font-size: 13px;
     background: Theme.bg;
 
@@ -516,6 +516,8 @@ export component EditorWindow inherits Window {
     in-out property <string> export-bitrate: "Auto";
     in-out property <float> export-progress: 0;
     in-out property <bool> export-in-progress: false;
+    in-out property <int> export-queue-count: 0;
+    in-out property <[string]> export-queue-items: [];
     // Keep the editor usable when the window is resized or split beside another app.
     property <bool> compact-layout: root.width < 1120px;
     property <bool> narrow-layout: root.width < 900px;
@@ -529,6 +531,7 @@ export component EditorWindow inherits Window {
 
     callback new-project();
     callback save-project();
+    callback recover-autosave();
     callback open-project();
     callback import-media();
     callback relink-media();
@@ -554,6 +557,10 @@ export component EditorWindow inherits Window {
     callback finish-move-clip();
     callback undo-edit();
     callback redo-edit();
+    callback split-selected-clip();
+    callback duplicate-selected-clip();
+    callback ripple-delete-selected-clip();
+    callback nudge-selected-clip(int);
 
     changed media-search => { root.filter-media(root.media-search, root.media-bin-filter); }
     changed media-assets => { root.filter-media(root.media-search, root.media-bin-filter); }
@@ -607,6 +614,13 @@ export component EditorWindow inherits Window {
                         clicked => { root.save-project(); }
                     }
 
+                    FlatButton {
+                        label: "Recover";
+                        compact: true;
+                        quiet: true;
+                        clicked => { root.recover-autosave(); }
+                    }
+
                     Rectangle {
                         width: 1px;
                         height: 24px;
@@ -649,9 +663,11 @@ export component EditorWindow inherits Window {
                 vertical-stretch: 1;
                 background: Theme.bg;
 
-                VerticalLayout {
-                    padding: 28px;
-                    spacing: 18px;
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        padding: 28px;
+                        spacing: 18px;
 
                     Text {
                         text: "EXPORT VIDEO";
@@ -965,7 +981,7 @@ export component EditorWindow inherits Window {
                                 }
 
                                 Text {
-                                    text: root.export-in-progress ? "1 job · Rendering current timeline" :
+                                    text: root.export-in-progress ? "Rendering · " + root.export-queue-count + " job(s) waiting" :
                                         (root.export-progress >= 1 ? "Last export completed" : "Ready when you are");
                                     color: Theme.text;
                                     font-size: 13px;
@@ -982,6 +998,38 @@ export component EditorWindow inherits Window {
                                 color: root.export-in-progress ? Theme.blue : Theme.muted;
                                 font-size: 13px;
                                 vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 96px;
+                        background: Theme.panel;
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 6px;
+                            Text {
+                                text: "WAITING QUEUE";
+                                color: Theme.muted;
+                                font-size: 12px;
+                                font-weight: 700;
+                            }
+                            ScrollView {
+                                vertical-stretch: 1;
+                                VerticalLayout {
+                                    spacing: 3px;
+                                    if root.export-queue-items.length == 0: Text {
+                                        text: "No waiting exports";
+                                        color: Theme.muted;
+                                        font-size: 12px;
+                                    }
+                                    for job in root.export-queue-items: Text {
+                                        text: job;
+                                        color: Theme.text;
+                                        font-size: 12px;
+                                        overflow: elide;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1033,11 +1081,11 @@ export component EditorWindow inherits Window {
                         }
 
                         FlatButton {
-                            label: root.export-in-progress ? "Rendering…" : "Render MP4…";
+                            label: root.export-in-progress ? "Queue another export…" : "Add export to queue…";
                             primary: true;
-                            enabled: !root.export-in-progress;
                             clicked => { root.export-project(); }
                         }
+                    }
                     }
                 }
             }
@@ -1345,19 +1393,11 @@ export component EditorWindow inherits Window {
                                 }
                             }
 
-                            // Clicking the preview seeks within the selected clip.
-                        // Convert the click to timeline time; Rust then maps it
-                        // back to the source in/out range for the active clip.
-                        TouchArea {
-                                clicked => {
-                                    root.seek-preview(min(1, max(0,
-                                    self.mouse-x / max(self.width, 1px))));
-                                }
-                            }
                         }
 
                         // Dedicated preview scrubber with a visible playhead.
-                    // The larger preview canvas remains clickable as well.
+                    // Keep seeking on this dedicated control so letterboxing
+                    // and preview aspect ratios never affect the seek position.
                     Rectangle {
                             height: 8px;
                             background: #292b30;
@@ -2091,6 +2131,36 @@ export component EditorWindow inherits Window {
                                 clicked => { root.redo-edit(); }
                             }
                             FlatButton {
+                                label: "Split";
+                                compact: true;
+                                enabled: root.selected-clip-id != "";
+                                clicked => { root.split-selected-clip(); }
+                            }
+                            FlatButton {
+                                label: "Duplicate";
+                                compact: true;
+                                enabled: root.selected-clip-id != "";
+                                clicked => { root.duplicate-selected-clip(); }
+                            }
+                            FlatButton {
+                                label: "Ripple delete";
+                                compact: true;
+                                enabled: root.selected-clip-id != "";
+                                clicked => { root.ripple-delete-selected-clip(); }
+                            }
+                            FlatButton {
+                                label: "−1f";
+                                compact: true;
+                                enabled: root.selected-clip-id != "";
+                                clicked => { root.nudge-selected-clip(-1); }
+                            }
+                            FlatButton {
+                                label: "+1f";
+                                compact: true;
+                                enabled: root.selected-clip-id != "";
+                                clicked => { root.nudge-selected-clip(1); }
+                            }
+                            FlatButton {
                                 label: "Delete clip";
                                 compact: true;
                                 clicked => { root.remove-selected-clip(); }
@@ -2202,11 +2272,11 @@ export component EditorWindow inherits Window {
                         // Keep the virtual canvas proportional to time without
                         // creating enormous surfaces for long recordings.
                         content-width: max(1px, max(timeline-scroll.visible-width,
-                            root.timeline-duration * 8px) * root.timeline-zoom);
+                            root.timeline-duration * 8px * root.timeline-zoom));
 
                             Rectangle {
                                 width: max(1px, max(timeline-scroll.visible-width,
-                                root.timeline-duration * 8px) * root.timeline-zoom);
+                                root.timeline-duration * 8px * root.timeline-zoom));
                                 height: 202px;
                                 background: #191c20;
                                 changed width => { root.timeline-canvas-width = self.width / 1px; }
@@ -2334,7 +2404,9 @@ export component EditorWindow inherits Window {
                                                                     root.move-clip(clip.id, root.dragged-start-seconds, root.drag-target-track);
                                                                 } else {
                                                                     root.seek-to(clip.start-seconds + clip.duration-seconds
-                                                                        * self.mouse-x / max(self.width, 1px));
+                                                                        * min(1, max(0, self.mouse-x / max(
+                                                                            clip.duration-seconds / max(root.timeline-duration, 0.001) * lane.width,
+                                                                            1px))));
                                                                 }
                                                                 parent.dragging = false;
                                                                 parent.moved-once = false;
@@ -2355,6 +2427,8 @@ export component EditorWindow inherits Window {
                                                                 * root.timeline-duration);
                                                             root.drag-dy += self.mouse-y / 1px - parent.press-y;
                                                             root.drag-target-track = max(0, min(3, clip.track + round(root.drag-dy / 44)));
+                                                            parent.press-x = self.mouse-x / 1px;
+                                                            parent.press-y = self.mouse-y / 1px;
                                                         }
                                                     }
                                                 }
@@ -2656,5 +2730,21 @@ export component EditorWindow inherits Window {
             keys: @keys(Delete);
             activated => { root.remove-selected-clip(); }
         }
+
+        KeyBinding {
+            keys: @keys(B);
+            activated => { root.split-selected-clip(); }
+        }
+
+        KeyBinding {
+            keys: @keys(Control + Shift + D);
+            activated => { root.duplicate-selected-clip(); }
+        }
+
+        KeyBinding {
+            keys: @keys(Meta + Shift + D);
+            activated => { root.duplicate-selected-clip(); }
+        }
+
     }
 }

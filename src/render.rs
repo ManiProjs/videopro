@@ -181,13 +181,13 @@ impl TimelineAudioPlayback {
 
         if labels.len() == 1 {
             graph.push_str(&format!(
-                "{}apad,atrim=duration={}[aout]",
+                "{}alimiter=limit=0.95,apad,atrim=duration={}[aout]",
                 labels[0],
                 fmt_seconds(remaining)
             ));
         } else {
             graph.push_str(&format!(
-                "{}amix=inputs={}:duration=longest:normalize=0,apad,atrim=duration={}[aout]",
+                "{}amix=inputs={}:duration=longest:normalize=0,alimiter=limit=0.95,apad,atrim=duration={}[aout]",
                 labels.join(""),
                 labels.len(),
                 fmt_seconds(remaining),
@@ -772,7 +772,7 @@ fn build_filter_graph(
     }
     if audio_labels.len() == 1 {
         graph.push_str(&format!(
-            ";{}apad,atrim=duration={}[aout]",
+            ";{}alimiter=limit=0.95,apad,atrim=duration={}[aout]",
             audio_labels[0],
             fmt_seconds(duration)
         ));
@@ -780,7 +780,7 @@ fn build_filter_graph(
         graph.push(';');
         graph.push_str(&audio_labels.join(""));
         graph.push_str(&format!(
-            "amix=inputs={}:duration=longest:normalize=0,apad,atrim=duration={}[aout]",
+            "amix=inputs={}:duration=longest:normalize=0,alimiter=limit=0.95,apad,atrim=duration={}[aout]",
             audio_labels.len(),
             fmt_seconds(duration)
         ));
@@ -1465,6 +1465,7 @@ mod tests {
         assert!(graph.contains("overlay=0:0"));
         assert!(graph.contains("between(t,2.000000,6.000000)"));
         assert!(graph.contains("amix=inputs=4"));
+        assert!(graph.contains("alimiter=limit=0.95"));
         assert!(graph.contains("[vout]"));
         assert!(graph.contains("[aout]"));
         let graph_60fps = build_filter_graph(&clips, &[0, 1], &[], 7.0, 1920, 1080, 60);
