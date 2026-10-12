@@ -1,0 +1,13 @@
+[package]
+name = "videopro"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rfd = "0.17.2"
+slint = { version = "~1.18.1", features = ["unstable-wgpu-30", "renderer-femtovg-wgpu"] }
+mpv-engine = { version = "0.2.1", features = ["wgpu"] }
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+slint-build = "1.18.1"

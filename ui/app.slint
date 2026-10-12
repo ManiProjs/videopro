@@ -1,0 +1,1753 @@
+
+import { LineEdit, ScrollView, Slider } from "std-widgets.slint";
+
+global Theme {
+    out property <color> bg: #17181a;
+    out property <color> panel: #202124;
+    out property <color> panel-2: #292b2e;
+    out property <color> line: #383a3e;
+    out property <color> text: #ececee;
+    out property <color> muted: #a0a1a4;
+    out property <color> blue: #4b8be8;
+    out property <color> blue-soft: #2a3b53;
+}
+
+struct Clip {
+    name: string,
+    path: string,
+    duration: string,
+    duration-seconds: float,
+    start-seconds: float,
+    source-in-seconds: float,
+    source-out-seconds: float,
+    track: int,
+    exposure: float,
+    contrast: float,
+    saturation: float,
+    opacity: float,
+    audio-gain-db: float,
+    blur: float,
+    sharpen: float,
+    transition-in-seconds: float,
+    transition-out-seconds: float,
+    thumbnail-a: image,
+    thumbnail-b: image,
+    thumbnail-c: image,
+    waveform: image,
+    color: color,
+}
+
+struct WorkspaceLayout {
+    name: string,
+    show-project-panel: bool,
+    show-properties-panel: bool,
+    show-effects-browser: bool,
+    show-timeline: bool,
+    timeline-height: float,
+    left-panel-width: float,
+    right-panel-width: float,
+    timeline-zoom: float,
+    active-mode: string,
+    edit-exposure: float,
+    edit-contrast: float,
+    edit-saturation: float,
+    edit-opacity: float,
+    edit-transition-in: float,
+    edit-transition-out: float,
+}
+
+struct RecentProject {
+    name: string,
+    path: string,
+    location: string,
+}
+
+component FlatButton inherits Rectangle {
+    in property <string> label: "Button";
+    in property <bool> active: false;
+    in property <bool> primary: false;
+    in property <bool> compact: false;
+    in property <bool> quiet: false;
+    callback clicked();
+
+    height: root.compact ? 28px : 34px;
+    min-width: root.compact ? 56px : 76px;
+    background: root.primary ?
+        (button-touch.pressed ? #326fc4 : (button-touch.has-hover ? #5a98f0 : Theme.blue)) :
+        (button-touch.pressed ? #3a3c41 :
+        (button-touch.has-hover ? (root.quiet ? #2d3035 : #36383d) :
+        (root.active ? Theme.blue-soft : (root.quiet ? transparent : #2b2c2f))));
+    border-radius: 4px;
+
+    Text {
+        text: root.label;
+        color: #f0f2f6;
+        font-size: root.compact ? 12px : 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    button-touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+component PanelHeader inherits Rectangle {
+    in property <string> title: "PANEL";
+    in property <string> detail: "";
+
+    height: 34px;
+    background: Theme.panel;
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 8px;
+
+        Text {
+            text: root.title;
+            color: Theme.text;
+            font-size: 12px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+
+        Rectangle {
+            horizontal-stretch: 1;
+            background: transparent;
+        }
+
+        Text {
+            text: root.detail;
+            color: Theme.muted;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component Divider inherits Rectangle {
+    height: 1px;
+    background: Theme.line;
+}
+
+component WindowControl inherits Rectangle {
+    in property <string> symbol: "";
+    in property <color> button-color: #36383e;
+    in property <bool> macos: false;
+    callback clicked();
+
+    width: root.macos ? 12px : 34px;
+    height: root.macos ? 12px : 30px;
+    background: root.button-color;
+    border-radius: root.macos ? 6px : 5px;
+
+    Text {
+        text: root.symbol;
+        color: #f0f2f6;
+        font-size: 15px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+component VideoProTitleBar inherits Rectangle {
+    in property <string> project-name: "Untitled Project";
+    in property <bool> is-macos: false;
+
+    callback close-window();
+    callback minimize-window();
+    callback toggle-maximize();
+
+    height: 44px;
+    background: Theme.panel;
+
+    WindowMoveArea {
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            spacing: 8px;
+            alignment: start;
+            cross-axis-alignment: center;
+
+            if root.is-macos: HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                cross-axis-alignment: center;
+
+                WindowControl {
+                    macos: true;
+                    button-color: #ff5f57;
+                    clicked => { root.close-window(); }
+                }
+
+                WindowControl {
+                    macos: true;
+                    button-color: #febc2e;
+                    clicked => { root.minimize-window(); }
+                }
+
+                WindowControl {
+                    macos: true;
+                    button-color: #28c840;
+                    clicked => { root.toggle-maximize(); }
+                }
+            }
+
+            Text {
+                text: "VideoPro";
+                color: Theme.text;
+                font-size: 14px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+
+            Text {
+                text: root.project-name;
+                color: Theme.muted;
+                font-size: 12px;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+                background: transparent;
+            }
+
+            if !root.is-macos: HorizontalLayout {
+                spacing: 4px;
+                alignment: end;
+                cross-axis-alignment: center;
+
+                WindowControl {
+                    symbol: "−";
+                    clicked => { root.minimize-window(); }
+                }
+
+                WindowControl {
+                    symbol: "□";
+                    clicked => { root.toggle-maximize(); }
+                }
+
+                WindowControl {
+                    symbol: "×";
+                    clicked => { root.close-window(); }
+                }
+            }
+        }
+    }
+}
+
+export component WelcomeWindow inherits Window {
+    title: "VideoPro";
+    no-frame: true;
+    width: 800px;
+    height: 520px;
+    background: Theme.bg;
+
+    in property <bool> is-macos: false;
+    in property <[RecentProject]> recent-projects: [];
+
+    callback create-project();
+    callback open-project();
+    callback open-recent-project(string);
+    callback close-window();
+    callback minimize-window();
+    callback toggle-maximize();
+
+    VerticalLayout {
+        spacing: 0px;
+
+        VideoProTitleBar {
+            project-name: "Welcome";
+            is-macos: root.is-macos;
+            close-window => { root.close-window(); }
+            minimize-window => { root.minimize-window(); }
+            toggle-maximize => { root.toggle-maximize(); }
+        }
+
+        HorizontalLayout {
+            padding: 36px;
+            spacing: 44px;
+
+            Rectangle {
+                width: 280px;
+                background: transparent;
+
+                VerticalLayout {
+                    padding-top: 20px;
+                    padding-right: 20px;
+                    spacing: 18px;
+
+                    Text {
+                        text: "A NEW PROJECT";
+                        color: Theme.muted;
+                        font-size: 11px;
+                    }
+
+                    Text {
+                        text: "Start creating";
+                        color: Theme.text;
+                        font-size: 30px;
+                        font-weight: 700;
+                    }
+
+                    Text {
+                        text: "A focused workspace for shaping footage into a finished film.";
+                        color: Theme.muted;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+
+                    FlatButton {
+                        label: "New project";
+                        primary: true;
+                        clicked => { root.create-project(); }
+                    }
+
+                    FlatButton {
+                        label: "Open project";
+                        quiet: true;
+                        clicked => { root.open-project(); }
+                    }
+
+                    Rectangle {
+                        vertical-stretch: 1;
+                        background: transparent;
+                    }
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+                background: transparent;
+
+                VerticalLayout {
+                    spacing: 12px;
+
+                    Text {
+                        text: "Recent projects";
+                        color: Theme.text;
+                        font-size: 14px;
+                        font-weight: 700;
+                    }
+
+                    Divider { }
+
+                    Rectangle {
+                        vertical-stretch: 1;
+                        background: transparent;
+
+                        if root.recent-projects.length == 0: Text {
+                            text: "No projects yet";
+                            color: Theme.muted;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        ScrollView {
+                            content-width: self.width;
+                            content-height: self.height;
+                            VerticalLayout {
+                                spacing: 6px;
+                                for project in root.recent-projects: Rectangle {
+                                    height: 58px;
+                                    background: recent-touch.has-hover ? #292d33 : #202124;
+                                    border-radius: 4px;
+                                    HorizontalLayout {
+                                        padding: 10px;
+                                        spacing: 8px;
+                                        VerticalLayout {
+                                            spacing: 4px;
+                                            Text {
+                                                text: project.name;
+                                                color: Theme.text;
+                                                font-size: 12px;
+                                                font-weight: 600;
+                                                overflow: elide;
+                                            }
+                                            Text {
+                                                text: project.location;
+                                                color: Theme.muted;
+                                                font-size: 10px;
+                                                overflow: elide;
+                                            }
+                                        }
+                                    }
+                                    recent-touch := TouchArea {
+                                        clicked => { root.open-recent-project(project.path); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "Your recent work will appear here.";
+                        color: Theme.muted;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+    }
+
+}
+
+export component EditorWindow inherits Window {
+    title: "VideoPro — Editor";
+    no-frame: true;
+    width: 1320px;
+    height: 850px;
+    background: Theme.bg;
+
+    in-out property <string> project-name: "Untitled Project";
+    in-out property <string> status-message: "Ready";
+    in-out property <string> active-mode: "Editing";
+    in-out property <bool> is-playing: false;
+    in-out property <string> playhead-time: "00:00:00.000";
+    in-out property <float> playhead-seconds: 0;
+    in-out property <float> timeline-playhead-seconds: 0;
+    in-out property <float> video-duration: 0;
+    in-out property <string> video-duration-time: "--:--";
+    in-out property <float> timeline-duration: 10;
+    in-out property <[Clip]> clips: [];
+    in-out property <[WorkspaceLayout]> custom-layouts: [];
+    in-out property <string> layout-name: "My Layout";
+    in-out property <string> selected-clip: "";
+    in-out property <float> edit-trim-in: 0;
+    in-out property <float> edit-trim-out: 0;
+    in-out property <int> edit-track: 1;
+    in-out property <float> edit-exposure: 0;
+    in-out property <float> edit-contrast: 1;
+    in-out property <float> edit-saturation: 1;
+    in-out property <float> edit-opacity: 1;
+    in-out property <float> edit-audio-gain-db: 0;
+    in-out property <float> edit-blur: 0;
+    in-out property <float> edit-sharpen: 0;
+    in-out property <float> edit-transition-in: 0;
+    in-out property <float> edit-transition-out: 0;
+    in-out property <bool> track-v2-muted: false;
+    in-out property <bool> track-v1-muted: false;
+    in-out property <bool> track-a1-muted: false;
+    in-out property <bool> track-a2-muted: false;
+    in-out property <bool> track-v2-solo: false;
+    in-out property <bool> track-v1-solo: false;
+    in-out property <bool> track-a1-solo: false;
+    in-out property <bool> track-a2-solo: false;
+    in-out property <float> track-v2-gain-db: 0;
+    in-out property <float> track-v1-gain-db: 0;
+    in-out property <float> track-a1-gain-db: 0;
+    in-out property <float> track-a2-gain-db: 0;
+    in-out property <float> track-v2-meter-rms: 0;
+    in-out property <float> track-v2-meter-peak: 0;
+    in-out property <float> track-v1-meter-rms: 0;
+    in-out property <float> track-v1-meter-peak: 0;
+    in-out property <float> track-a1-meter-rms: 0;
+    in-out property <float> track-a1-meter-peak: 0;
+    in-out property <float> track-a2-meter-rms: 0;
+    in-out property <float> track-a2-meter-peak: 0;
+    in-out property <float> master-meter-rms: 0;
+    in-out property <float> master-meter-peak: 0;
+    in-out property <float> dragged-start-seconds: 0;
+    in-out property <float> timeline-canvas-width: 900;
+    in-out property <float> timeline-zoom: 1.0;
+    in-out property <bool> show-project-panel: true;
+    in-out property <bool> show-properties-panel: true;
+    in-out property <bool> show-effects-browser: false;
+    in-out property <bool> show-timeline: true;
+    in-out property <float> timeline-height: 276;
+    in-out property <float> left-panel-width: 240;
+    in-out property <float> right-panel-width: 272;
+    in-out property <int> export-width: 1920;
+    in-out property <int> export-height: 1080;
+    in-out property <string> export-quality: "High";
+    in-out property <float> export-progress: 0;
+    in-out property <bool> export-in-progress: false;
+    // Keep the editor usable when the window is resized or split beside another app.
+    property <bool> compact-layout: root.width < 1120px;
+    property <bool> narrow-layout: root.width < 900px;
+
+    // Frame supplied by the Rust video player.
+    in-out property <image> video-frame;
+    in-out property <bool> has-video-frame: false;
+
+    in property <bool> is-macos: false;
+
+    callback new-project();
+    callback save-project();
+    callback open-project();
+    callback import-media();
+    callback toggle-playback();
+    callback export-project();
+    callback save-layout(string);
+    callback load-layout(string);
+    callback reset-layout();
+    callback remove-selected-clip();
+    callback seek-relative(int);
+    callback seek-to(float);
+    callback seek-preview(float);
+    callback select-clip(string);
+    callback apply-clip-edits();
+    callback apply-track-audio-settings();
+    callback move-clip(string, float, int);
+    callback begin-move-clip();
+    callback finish-move-clip();
+    callback undo-edit();
+    callback redo-edit();
+
+    callback close-window();
+    callback minimize-window();
+    callback toggle-maximize();
+
+    forward-focus: keyboard-shortcuts;
+    keyboard-shortcuts := FocusScope {
+    VerticalLayout {
+        spacing: 0px;
+
+        VideoProTitleBar {
+            project-name: root.project-name;
+            is-macos: root.is-macos;
+
+            close-window => { root.close-window(); }
+            minimize-window => { root.minimize-window(); }
+            toggle-maximize => { root.toggle-maximize(); }
+        }
+
+        Rectangle {
+            height: 42px;
+            background: Theme.panel;
+
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 4px;
+
+                FlatButton {
+                    label: "New";
+                    compact: true;
+                    quiet: true;
+                    clicked => { root.new-project(); }
+                }
+
+                FlatButton {
+                    label: "Open";
+                    compact: true;
+                    quiet: true;
+                    clicked => { root.open-project(); }
+                }
+
+                FlatButton {
+                    label: "Save";
+                    compact: true;
+                    quiet: true;
+                    clicked => { root.save-project(); }
+                }
+
+                Rectangle {
+                    width: 1px;
+                    height: 24px;
+                    background: Theme.line;
+                }
+
+                for mode in ["Media", "Editing", "Color", "Audio", "Effects"]: FlatButton {
+                    label: mode;
+                    compact: true;
+                    quiet: true;
+                    active: root.active-mode == mode;
+                    clicked => { root.active-mode = mode; }
+                }
+
+                Rectangle {
+                    width: 1px;
+                    height: 24px;
+                    background: Theme.line;
+                }
+
+                FlatButton {
+                    label: "Import";
+                    primary: true;
+                    compact: true;
+                    clicked => { root.import-media(); }
+                }
+
+                FlatButton {
+                    label: "Export";
+                    compact: true;
+                    active: root.active-mode == "Export";
+                    clicked => { root.active-mode = "Export"; }
+                }
+            }
+        }
+
+        Divider { }
+
+        if root.active-mode == "Export": Rectangle {
+            vertical-stretch: 1;
+            background: Theme.bg;
+
+            VerticalLayout {
+                padding: 28px;
+                spacing: 18px;
+
+                Text { text: "EXPORT VIDEO"; color: Theme.muted; font-size: 11px; font-weight: 700; }
+                Text { text: "Deliver your edit"; color: Theme.text; font-size: 28px; font-weight: 700; }
+                Text {
+                    text: "Choose an output profile. VideoPro renders your timeline and applied clip adjustments to an MP4 file.";
+                    color: Theme.muted;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                    max-width: 620px;
+                }
+
+                Rectangle {
+                    height: 1px;
+                    background: Theme.line;
+                }
+
+                Text { text: "RESOLUTION"; color: Theme.muted; font-size: 11px; font-weight: 700; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    FlatButton { label: "720p · 1280 × 720"; active: root.export-width == 1280; clicked => { root.export-width = 1280; root.export-height = 720; } }
+                    FlatButton { label: "1080p · 1920 × 1080"; active: root.export-width == 1920; clicked => { root.export-width = 1920; root.export-height = 1080; } }
+                    FlatButton { label: "4K · 3840 × 2160"; active: root.export-width == 3840; clicked => { root.export-width = 3840; root.export-height = 2160; } }
+                }
+
+                Text { text: "QUALITY"; color: Theme.muted; font-size: 11px; font-weight: 700; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    FlatButton { label: "Draft · Faster"; active: root.export-quality == "Draft"; clicked => { root.export-quality = "Draft"; } }
+                    FlatButton { label: "Standard"; active: root.export-quality == "Standard"; clicked => { root.export-quality = "Standard"; } }
+                    FlatButton { label: "High · Best quality"; active: root.export-quality == "High"; clicked => { root.export-quality = "High"; } }
+                }
+
+                Rectangle {
+                    height: 78px;
+                    background: Theme.panel;
+                    border-radius: 5px;
+                    HorizontalLayout {
+                        padding: 14px;
+                        spacing: 18px;
+                        VerticalLayout {
+                            spacing: 4px;
+                            Text { text: "OUTPUT FORMAT"; color: Theme.muted; font-size: 10px; }
+                            Text { text: "MP4 · H.264 video · AAC audio when available"; color: Theme.text; font-size: 12px; }
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        VerticalLayout {
+                            spacing: 4px;
+                            Text { text: "FRAME SIZE"; color: Theme.muted; font-size: 10px; }
+                            Text { text: "" + root.export-width + " × " + root.export-height; color: Theme.text; font-size: 12px; }
+                        }
+                        VerticalLayout {
+                            spacing: 4px;
+                            Text { text: "QUALITY"; color: Theme.muted; font-size: 10px; }
+                            Text { text: root.export-quality; color: Theme.text; font-size: 12px; }
+                        }
+                    }
+                }
+
+                Rectangle { vertical-stretch: 1; background: transparent; }
+
+                Text {
+                    text: root.status-message;
+                    color: Theme.muted;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+
+                Rectangle {
+                    height: 8px;
+                    background: #303237;
+                    border-radius: 4px;
+                    clip: true;
+
+                    Rectangle {
+                        width: parent.width * max(0, min(1, root.export-progress));
+                        height: parent.height;
+                        background: Theme.blue;
+                        border-radius: 4px;
+                        animate width { duration: 120ms; }
+                    }
+                }
+
+                Text {
+                    text: root.export-in-progress ? "Rendering · " + round(root.export-progress * 100) + "%" :
+                        (root.export-progress >= 1 ? "Export finished" : "Ready to export");
+                    color: Theme.muted;
+                    font-size: 11px;
+                }
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    FlatButton { label: "← Back to editor"; clicked => { root.active-mode = "Editing"; } }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    FlatButton {
+                        label: root.export-in-progress ? "Rendering…" : "Render MP4…";
+                        primary: true;
+                        clicked => { root.export-project(); }
+                    }
+                }
+            }
+        }
+
+        if root.active-mode != "Export": HorizontalLayout {
+            vertical-stretch: 1;
+            spacing: 0px;
+
+            if root.show-project-panel && (root.active-mode == "Media" ||
+                root.active-mode == "Editing" ||
+                root.active-mode == "Audio" ||
+                root.active-mode == "Color"): Rectangle {
+                width: min(root.left-panel-width * 1px,
+                    max(168px, root.width * (root.compact-layout ? 0.20 : 0.23)));
+                background: Theme.panel;
+
+                VerticalLayout {
+                    spacing: 0px;
+
+                    PanelHeader {
+                        title: root.active-mode == "Media" ? "MEDIA LIBRARY" : "PROJECT";
+                        detail: "" + root.clips.length + " items";
+                    }
+
+                    Rectangle {
+                        vertical-stretch: 1;
+                        background: Theme.bg;
+
+                        ScrollView {
+                            VerticalLayout {
+                                spacing: 0px;
+
+                            for clip in root.clips: Rectangle {
+                                height: 58px;
+                                background: root.selected-clip == clip.path ? #263b54 : Theme.bg;
+
+                                HorizontalLayout {
+                                    padding: 9px;
+                                    spacing: 10px;
+
+                                    Rectangle {
+                                        width: 54px;
+                                        height: 38px;
+                                        background: clip.color;
+                                        border-radius: 3px;
+
+                                        Image {
+                                            source: clip.thumbnail-a;
+                                            image-fit: cover;
+                                            width: 100%;
+                                            height: 100%;
+                                        }
+                                    }
+
+                                    VerticalLayout {
+                                        spacing: 3px;
+
+                                        Text {
+                                            text: clip.name;
+                                            color: Theme.text;
+                                            font-size: 12px;
+                                            font-weight: 600;
+                                            overflow: elide;
+                                        }
+
+                                        Text {
+                                            text: "VIDEO  ·  " + clip.duration;
+                                            color: Theme.muted;
+                                            font-size: 9px;
+                                        }
+                                    }
+                                }
+
+                                TouchArea {
+                                    clicked => {
+                                        root.selected-clip = clip.path;
+                                        root.select-clip(clip.path);
+                                    }
+                                }
+                            }
+
+                            if root.clips.length == 0: Text {
+                                text: "No media imported";
+                                color: Theme.muted;
+                                font-size: 12px;
+                            }
+                            }
+                        }
+                    }
+
+                    Divider { }
+
+                    FlatButton {
+                        label: "+ Import media";
+                        primary: true;
+                        clicked => { root.import-media(); }
+                    }
+                }
+            }
+
+            if root.show-project-panel && (root.active-mode == "Media" || root.active-mode == "Editing" || root.active-mode == "Audio" || root.active-mode == "Color"): Rectangle {
+                width: 6px;
+                background: left-splitter-touch.pressed ? Theme.blue : (left-splitter-touch.has-hover ? #4a4d53 : Theme.line);
+                property <float> last-x: 0;
+                left-splitter-touch := TouchArea {
+                    moved => {
+                        if self.pressed {
+                            root.left-panel-width = min(320, max(180, root.left-panel-width + self.mouse-x / 1px - parent.last-x));
+                            parent.last-x = self.mouse-x / 1px;
+                        }
+                    }
+                    changed pressed => { if (self.pressed) { parent.last-x = self.mouse-x / 1px; } }
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+                    background: #151619;
+
+                VerticalLayout {
+                    spacing: 0px;
+
+                    PanelHeader {
+                        title: "Preview";
+                        detail: root.playhead-time + " / " + root.video-duration-time;
+                    }
+
+                    Rectangle {
+                        vertical-stretch: 1;
+                        background: #0d0e10;
+
+                        if root.has-video-frame: Image {
+                            source: root.video-frame;
+                            image-fit: contain;
+                            width: 100%;
+                            height: 100%;
+                        }
+
+                        if !root.has-video-frame: VerticalLayout {
+                            alignment: center;
+                            spacing: 8px;
+
+                            Text {
+                                text: "No clip loaded";
+                                color: #c7c8c9;
+                                font-size: 13px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                            }
+
+                            Text {
+                                text: "Select a clip in the media panel to preview it here.";
+                                color: Theme.muted;
+                                font-size: 11px;
+                                horizontal-alignment: center;
+                            }
+                        }
+
+                        // Clicking the preview seeks within the selected clip.
+                        // Convert the click to timeline time; Rust then maps it
+                        // back to the source in/out range for the active clip.
+                        TouchArea {
+                            clicked => {
+                                root.seek-preview(min(1, max(0,
+                                    self.mouse-x / max(self.width, 1px))));
+                            }
+                        }
+                    }
+
+                    // Dedicated preview scrubber with a visible playhead.
+                    // The larger preview canvas remains clickable as well.
+                    Rectangle {
+                        height: 8px;
+                        background: #292b30;
+
+                        Rectangle {
+                            height: 2px;
+                            y: 3px;
+                            background: #438cf5;
+                            width: min(parent.width, max(0px,
+                                (root.playhead-seconds - root.edit-trim-in) /
+                                max(root.edit-trim-out - root.edit-trim-in, 0.05) * parent.width));
+                        }
+
+                        TouchArea {
+                            clicked => {
+                                root.seek-preview(min(1, max(0,
+                                    self.mouse-x / max(self.width, 1px))));
+                            }
+                        }
+                    }
+
+                    Divider { }
+
+                    Rectangle {
+                        height: 44px;
+                        background: transparent;
+
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 8px;
+
+                            FlatButton {
+                                label: "−5s";
+                                compact: true;
+                                clicked => { root.seek-relative(-5); }
+                            }
+
+                            FlatButton {
+                                label: root.is-playing ? "Pause" : "Play";
+                                primary: true;
+                                compact: true;
+                                clicked => { root.toggle-playback(); }
+                            }
+
+                            FlatButton {
+                                label: "+5s";
+                                compact: true;
+                                clicked => { root.seek-relative(5); }
+                            }
+                        }
+
+                        Text {
+                            x: parent.width - self.width - 12px;
+                            y: (parent.height - self.height) / 2;
+                            width: 150px;
+                            text: root.status-message;
+                            color: Theme.muted;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                            horizontal-alignment: right;
+                            overflow: elide;
+                        }
+                    }
+                }
+            }
+
+            if root.show-properties-panel && (root.active-mode == "Color" ||
+                root.active-mode == "Effects" ||
+                root.active-mode == "Audio" ||
+                root.active-mode == "Editing"): Rectangle {
+                width: min(root.right-panel-width * 1px,
+                    max(200px, root.width * (root.compact-layout ? 0.23 : 0.25)));
+                background: Theme.panel;
+
+                VerticalLayout {
+                    spacing: 0px;
+
+                    PanelHeader {
+                        title: root.active-mode == "Color" ? "COLOR GRADE" :
+                            (root.active-mode == "Effects" ? "EFFECT STACK" :
+                            (root.active-mode == "Audio" ? "AUDIO CONTROLS" : "CLIP PROPERTIES"));
+                        detail: root.selected-clip == "" ? "No selection" : "Selected clip";
+                    }
+
+                    ScrollView {
+                        vertical-stretch: 1;
+
+                        VerticalLayout {
+                            padding: 14px;
+                            spacing: 14px;
+
+                            Text {
+                                text: root.selected-clip == "" ?
+                                    "Nothing selected" : root.selected-clip;
+                                color: Theme.text;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+
+                            if root.active-mode == "Editing": VerticalLayout {
+                                spacing: 12px;
+                                Text { text: "TRIM & PLACEMENT"; color: Theme.muted; font-size: 10px; font-weight: 700; }
+                                Text { text: "In point  " + root.edit-trim-in + "s"; color: Theme.text; font-size: 11px; }
+                                Slider { minimum: 0; maximum: max(root.video-duration, 0.1); value: root.edit-trim-in; changed(value) => { root.edit-trim-in = min(value, root.edit-trim-out - 0.05); root.apply-clip-edits(); } }
+                                Text { text: "Out point  " + root.edit-trim-out + "s"; color: Theme.text; font-size: 11px; }
+                                Slider { minimum: 0.1; maximum: max(root.video-duration, 0.1); value: root.edit-trim-out; changed(value) => { root.edit-trim-out = max(value, root.edit-trim-in + 0.05); root.apply-clip-edits(); } }
+                                Text { text: "TRACK"; color: Theme.muted; font-size: 10px; font-weight: 700; }
+                                HorizontalLayout {
+                                    spacing: 4px;
+                                    for track in [0, 1, 2, 3]: FlatButton { label: ["V2", "V1", "A1", "A2"][track]; compact: true; active: root.edit-track == track; clicked => { root.edit-track = track; root.apply-clip-edits(); } }
+                                }
+                                Text { text: "TRANSITIONS"; color: Theme.muted; font-size: 10px; font-weight: 700; }
+                                Text { text: "Fade in  " + root.edit-transition-in + "s"; color: Theme.text; font-size: 11px; }
+                                Slider { minimum: 0; maximum: 2; value: root.edit-transition-in; changed(value) => { root.edit-transition-in = value; root.apply-clip-edits(); } }
+                                Text { text: "Fade out  " + root.edit-transition-out + "s"; color: Theme.text; font-size: 11px; }
+                                Slider { minimum: 0; maximum: 2; value: root.edit-transition-out; changed(value) => { root.edit-transition-out = value; root.apply-clip-edits(); } }
+                                FlatButton { label: "Remove selected clip"; compact: true; clicked => { root.remove-selected-clip(); } }
+                            }
+
+                            if root.active-mode == "Color": VerticalLayout {
+                                spacing: 12px;
+                                Text { text: "COLOR CORRECTION"; color: Theme.muted; font-size: 10px; font-weight: 700; }
+                                for control in ["Exposure", "Contrast", "Saturation"]: VerticalLayout {
+                                    spacing: 6px;
+                                    Text { text: control; color: Theme.text; font-size: 12px; }
+                                    if control == "Exposure": Slider { minimum: -100; maximum: 100; value: root.edit-exposure; changed(value) => { root.edit-exposure = value; root.apply-clip-edits(); } }
+                                    if control == "Contrast": Slider { minimum: 0; maximum: 200; value: root.edit-contrast * 100; changed(value) => { root.edit-contrast = value / 100; root.apply-clip-edits(); } }
+                                    if control == "Saturation": Slider { minimum: 0; maximum: 200; value: root.edit-saturation * 100; changed(value) => { root.edit-saturation = value / 100; root.apply-clip-edits(); } }
+                                }
+                                Divider { }
+                                Text { text: "QUICK GRADES"; color: Theme.muted; font-size: 10px; font-weight: 700; }
+                                FlatButton { label: "Neutral"; compact: true; clicked => { root.edit-exposure = 0; root.edit-contrast = 1; root.edit-saturation = 1; root.apply-clip-edits(); } }
+                                FlatButton { label: "Cinematic"; compact: true; clicked => { root.edit-exposure = -8; root.edit-contrast = 1.25; root.edit-saturation = 0.78; root.apply-clip-edits(); } }
+                                FlatButton { label: "Vivid"; compact: true; clicked => { root.edit-exposure = 4; root.edit-contrast = 1.12; root.edit-saturation = 1.55; root.apply-clip-edits(); } }
+                                FlatButton { label: "Muted"; compact: true; clicked => { root.edit-exposure = -2; root.edit-contrast = 0.92; root.edit-saturation = 0.55; root.apply-clip-edits(); } }
+                            }
+
+                            if root.active-mode == "Effects": VerticalLayout {
+                                spacing: 12px;
+                                Text { text: "APPLIED ADJUSTMENTS"; color: Theme.muted; font-size: 10px; font-weight: 700; }
+                                Text { text: "Exposure  " + root.edit-exposure; color: Theme.text; font-size: 11px; }
+                                Text { text: "Contrast  " + root.edit-contrast; color: Theme.text; font-size: 11px; }
+                                Text { text: "Saturation  " + root.edit-saturation; color: Theme.text; font-size: 11px; }
+                                Text { text: "Opacity  " + root.edit-opacity; color: Theme.text; font-size: 11px; }
+                                Text { text: "Blur  " + root.edit-blur; color: Theme.text; font-size: 11px; }
+                                Slider { minimum: 0; maximum: 10; value: root.edit-blur; changed(value) => { root.edit-blur = value; root.apply-clip-edits(); } }
+                                Text { text: "Sharpen  " + root.edit-sharpen; color: Theme.text; font-size: 11px; }
+                                Slider { minimum: 0; maximum: 5; value: root.edit-sharpen; changed(value) => { root.edit-sharpen = value; root.apply-clip-edits(); } }
+                                Divider { }
+                                Text { text: "EFFECT PARAMETERS"; color: Theme.muted; font-size: 10px; font-weight: 700; }
+                                Text { text: "Use the Premade Effects panel to apply a preset, then fine-tune it here."; color: Theme.muted; font-size: 11px; wrap: word-wrap; }
+                            }
+
+                            if root.active-mode == "Audio": VerticalLayout {
+                                spacing: 12px;
+                                Text { text: "CLIP & TRACK"; color: Theme.muted; font-size: 10px; font-weight: 700; }
+                                Text { text: "Place selected media on a track:"; color: Theme.text; font-size: 12px; }
+                                for track in [0, 1, 2, 3]: FlatButton { label: ["V2", "V1", "A1", "A2"][track]; compact: true; active: root.edit-track == track; clicked => { root.edit-track = track; root.apply-clip-edits(); } }
+                                Divider { }
+                                Text { text: "CLIP GAIN"; color: Theme.muted; font-size: 10px; font-weight: 700; }
+                                Text { text: "Clip gain  " + root.edit-audio-gain-db + " dB"; color: Theme.text; font-size: 12px; }
+                                Slider { minimum: -24; maximum: 12; value: root.edit-audio-gain-db; changed(value) => { root.edit-audio-gain-db = value; root.apply-clip-edits(); } }
+                                FlatButton { label: "Reset gain"; compact: true; clicked => { root.edit-audio-gain-db = 0; root.apply-clip-edits(); } }
+                                Divider { }
+                                Text { text: "TRACK MIXER"; color: Theme.muted; font-size: 10px; font-weight: 700; }
+                                Text { text: "Track " + (root.edit-track == 0 ? "V2" : root.edit-track == 1 ? "V1" : root.edit-track == 2 ? "A1" : "A2") + " gain"; color: Theme.text; font-size: 12px; }
+                                Slider {
+                                    minimum: -24;
+                                    maximum: 12;
+                                    value: root.edit-track == 0 ? root.track-v2-gain-db : root.edit-track == 1 ? root.track-v1-gain-db : root.edit-track == 2 ? root.track-a1-gain-db : root.track-a2-gain-db;
+                                    changed(value) => {
+                                        if root.edit-track == 0 { root.track-v2-gain-db = value; }
+                                        else if root.edit-track == 1 { root.track-v1-gain-db = value; }
+                                        else if root.edit-track == 2 { root.track-a1-gain-db = value; }
+                                        else { root.track-a2-gain-db = value; }
+                                        root.apply-track-audio-settings();
+                                    }
+                                }
+                                Text { text: "Track mute/solo: use M and S beside each timeline lane. Track gain is combined with clip gain during playback and export."; color: Theme.muted; font-size: 11px; wrap: word-wrap; }
+                                Divider { }
+                                Text { text: "LIVE LEVELS · −60 TO 0 dBFS"; color: Theme.muted; font-size: 10px; font-weight: 700; }
+                                for meter-track in [0, 1, 2, 3]: HorizontalLayout {
+                                    width: 220px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: ["V2", "V1", "A1", "A2"][meter-track];
+                                        color: Theme.text;
+                                        font-size: 10px;
+                                        width: 26px;
+                                    }
+                                    Rectangle {
+                                        width: 184px;
+                                        height: 9px;
+                                        background: #25282e;
+                                        border-radius: 2px;
+                                        Rectangle {
+                                            width: (meter-track == 0 ? root.track-v2-meter-peak : meter-track == 1 ? root.track-v1-meter-peak : meter-track == 2 ? root.track-a1-meter-peak : root.track-a2-meter-peak) * parent.width;
+                                            height: parent.height;
+                                            background: (meter-track == 0 ? root.track-v2-meter-peak : meter-track == 1 ? root.track-v1-meter-peak : meter-track == 2 ? root.track-a1-meter-peak : root.track-a2-meter-peak) > 0.9 ? #e35d5d : #6cc68b;
+                                        }
+                                        Rectangle {
+                                            width: (meter-track == 0 ? root.track-v2-meter-rms : meter-track == 1 ? root.track-v1-meter-rms : meter-track == 2 ? root.track-a1-meter-rms : root.track-a2-meter-rms) * parent.width;
+                                            height: parent.height;
+                                            background: #438cf5;
+                                        }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    width: 220px;
+                                    spacing: 8px;
+                                    Text { text: "Master"; color: Theme.text; font-size: 10px; width: 42px; }
+                                    Rectangle {
+                                        width: 170px;
+                                        height: 11px;
+                                        background: #25282e;
+                                        border-radius: 2px;
+                                        Rectangle {
+                                            width: root.master-meter-peak * parent.width;
+                                            height: parent.height;
+                                            background: root.master-meter-peak > 0.9 ? #e35d5d : #6cc68b;
+                                        }
+                                        Rectangle {
+                                            width: root.master-meter-rms * parent.width;
+                                            height: parent.height;
+                                            background: #438cf5;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if root.show-properties-panel && (root.active-mode == "Color" || root.active-mode == "Effects" || root.active-mode == "Audio" || root.active-mode == "Editing"): Rectangle {
+                width: 6px;
+                background: right-splitter-touch.pressed ? Theme.blue : (right-splitter-touch.has-hover ? #4a4d53 : Theme.line);
+                property <float> last-x: 0;
+                right-splitter-touch := TouchArea {
+                    moved => {
+                        if self.pressed {
+                            root.right-panel-width = min(360, max(200, root.right-panel-width - self.mouse-x / 1px + parent.last-x));
+                            parent.last-x = self.mouse-x / 1px;
+                        }
+                    }
+                    changed pressed => { if (self.pressed) { parent.last-x = self.mouse-x / 1px; } }
+                }
+            }
+
+            if root.show-effects-browser && root.active-mode == "Effects": Rectangle {
+                width: root.compact-layout ? 176px : 220px;
+                background: Theme.panel;
+
+                VerticalLayout {
+                    spacing: 0px;
+
+                    PanelHeader {
+                        title: "PREMADE EFFECTS";
+                        detail: "Presets";
+                    }
+
+                    Text {
+                        text: "Apply a starting look, then adjust its parameters in Effect Stack.";
+                        color: Theme.muted;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+
+                    for effect in [
+                        "Black & white",
+                        "Cinematic",
+                        "Vivid",
+                        "Muted",
+                        "Dreamy fade",
+                        "High contrast",
+                        "Soft blur",
+                        "Sharpen",
+                        "Reset effects"
+                    ]: Rectangle {
+                        height: 40px;
+                        background: Theme.panel;
+
+                        HorizontalLayout {
+                            padding-left: 14px;
+
+                            Text {
+                                text: effect;
+                                color: Theme.text;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        TouchArea {
+                            clicked => {
+                                if effect == "Black & white" { root.edit-saturation = 0; root.edit-contrast = 1.08; }
+                                if effect == "Cinematic" { root.edit-exposure = -8; root.edit-contrast = 1.25; root.edit-saturation = 0.78; }
+                                if effect == "Vivid" { root.edit-exposure = 4; root.edit-contrast = 1.12; root.edit-saturation = 1.55; }
+                                if effect == "Muted" { root.edit-exposure = -2; root.edit-contrast = 0.92; root.edit-saturation = 0.55; }
+                                if effect == "Dreamy fade" { root.edit-exposure = 5; root.edit-contrast = 0.82; root.edit-saturation = 0.72; root.edit-transition-in = 0.8; root.edit-transition-out = 0.8; }
+                                if effect == "High contrast" { root.edit-exposure = 0; root.edit-contrast = 1.65; root.edit-saturation = 1.1; }
+                                if effect == "Soft blur" { root.edit-blur = 4; root.edit-sharpen = 0; }
+                                if effect == "Sharpen" { root.edit-sharpen = 1.5; root.edit-blur = 0; }
+                                if effect == "Reset effects" { root.edit-exposure = 0; root.edit-contrast = 1; root.edit-saturation = 1; root.edit-opacity = 1; root.edit-blur = 0; root.edit-sharpen = 0; root.edit-audio-gain-db = 0; root.edit-transition-in = 0; root.edit-transition-out = 0; }
+                                root.apply-clip-edits();
+                                root.status-message = effect + " applied";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.show-timeline && root.active-mode != "Export": Rectangle {
+            height: 6px;
+            background: timeline-splitter-touch.pressed ? Theme.blue : (timeline-splitter-touch.has-hover ? #4a4d53 : Theme.line);
+            property <float> last-y: 0;
+            timeline-splitter-touch := TouchArea {
+                moved => {
+                    if self.pressed {
+                        root.timeline-height = min(420, max(180, root.timeline-height - self.mouse-y / 1px + parent.last-y));
+                        parent.last-y = self.mouse-y / 1px;
+                    }
+                }
+                changed pressed => { if (self.pressed) { parent.last-y = self.mouse-y / 1px; } }
+            }
+        }
+
+        Divider { }
+
+        if root.show-timeline && root.active-mode != "Export": Rectangle {
+            height: min(root.timeline-height * 1px, max(160px, root.height * 0.40));
+            background: Theme.bg;
+
+            VerticalLayout {
+                spacing: 0px;
+
+                Rectangle {
+                    height: 38px;
+                    background: Theme.panel;
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 10px;
+
+                        Text {
+                            text: "Timeline";
+                            color: Theme.text;
+                            font-size: 12px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+
+                        Text {
+                            text: root.playhead-time;
+                            color: #80b6ff;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                        }
+
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            background: transparent;
+                        }
+
+                        Text {
+                            text: "Zoom";
+                            color: Theme.muted;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                        }
+
+                        if !root.compact-layout: Slider {
+                            width: 110px;
+                            minimum: 25;
+                            maximum: 200;
+                            value: root.timeline-zoom * 100;
+                            changed(value) => { root.timeline-zoom = value / 100; }
+                        }
+
+                        if !root.narrow-layout: FlatButton {
+                            label: "Undo";
+                            compact: true;
+                            clicked => { root.undo-edit(); }
+                        }
+                        if !root.narrow-layout: FlatButton {
+                            label: "Redo";
+                            compact: true;
+                            clicked => { root.redo-edit(); }
+                        }
+                        FlatButton {
+                            label: "Delete clip";
+                            compact: true;
+                            clicked => { root.remove-selected-clip(); }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 0px;
+
+                    Rectangle {
+                        width: 84px;
+                        background: Theme.panel;
+
+                        VerticalLayout {
+                            spacing: 0px;
+
+                            Rectangle {
+                                height: 26px;
+                                background: Theme.panel-2;
+
+                                Text {
+                                    text: "Track";
+                                    color: Theme.muted;
+                                    font-size: 10px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            for track in ["V2", "V1", "A1", "A2"]: Rectangle {
+                                height: 44px;
+                                background: #222326;
+
+                                VerticalLayout {
+                                    spacing: 1px;
+                                    alignment: center;
+                                    Text {
+                                        text: track;
+                                        color: track == "V2" || track == "V1" ? #8bbcff : #b3bac5;
+                                        font-size: 11px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 2px;
+                                        alignment: center;
+                                        Rectangle {
+                                            width: 24px;
+                                            height: 16px;
+                                            border-radius: 2px;
+                                            background: (track == "V2" && root.track-v2-muted) || (track == "V1" && root.track-v1-muted) || (track == "A1" && root.track-a1-muted) || (track == "A2" && root.track-a2-muted) ? #8c4545 : #34363a;
+                                            Text { text: "M"; color: #f0f2f6; font-size: 9px; horizontal-alignment: center; vertical-alignment: center; }
+                                            TouchArea { clicked => {
+                                                if track == "V2" { root.track-v2-muted = !root.track-v2-muted; }
+                                                else if track == "V1" { root.track-v1-muted = !root.track-v1-muted; }
+                                                else if track == "A1" { root.track-a1-muted = !root.track-a1-muted; }
+                                                else { root.track-a2-muted = !root.track-a2-muted; }
+                                                root.apply-track-audio-settings();
+                                            } }
+                                        }
+                                        Rectangle {
+                                            width: 24px;
+                                            height: 16px;
+                                            border-radius: 2px;
+                                            background: (track == "V2" && root.track-v2-solo) || (track == "V1" && root.track-v1-solo) || (track == "A1" && root.track-a1-solo) || (track == "A2" && root.track-a2-solo) ? #8a6b2e : #34363a;
+                                            Text { text: "S"; color: #f0f2f6; font-size: 9px; horizontal-alignment: center; vertical-alignment: center; }
+                                            TouchArea { clicked => {
+                                                if track == "V2" { root.track-v2-solo = !root.track-v2-solo; }
+                                                else if track == "V1" { root.track-v1-solo = !root.track-v1-solo; }
+                                                else if track == "A1" { root.track-a1-solo = !root.track-a1-solo; }
+                                                else { root.track-a2-solo = !root.track-a2-solo; }
+                                                root.apply-track-audio-settings();
+                                            } }
+                                        }
+                                    }
+                                }
+
+                                Divider { }
+                            }
+                        }
+                    }
+
+                    timeline-scroll := ScrollView {
+                        horizontal-stretch: 1;
+                        vertical-stretch: 1;
+                        horizontal-scrollbar-policy: ScrollBarPolicy.as-needed;
+                        vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
+                        // Keep the virtual canvas proportional to time without
+                        // creating enormous surfaces for long recordings.
+                        content-width: max(timeline-scroll.visible-width,
+                            max(900px, root.timeline-duration * 8px) * root.timeline-zoom);
+
+                        Rectangle {
+                            width: max(timeline-scroll.visible-width,
+                                max(900px, root.timeline-duration * 8px) * root.timeline-zoom);
+                            height: 202px;
+                            background: #191a1d;
+                            changed width => { root.timeline-canvas-width = self.width / 1px; }
+
+                            VerticalLayout {
+                                spacing: 0px;
+
+                                Rectangle {
+                                    height: 26px;
+                                    background: Theme.panel-2;
+
+                                    for mark in [0, 1, 2, 3, 4]: Rectangle {
+                                        x: parent.width * mark / 4;
+                                        width: 1px;
+                                        height: 26px;
+                                        background: #4a4c50;
+
+                                        Text {
+                                            x: 5px;
+                                            text: "" + (root.timeline-duration * mark / 4) + "s";
+                                            color: Theme.muted;
+                                            font-size: 10px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+
+                                for track in [0, 1, 2, 3]: Rectangle {
+                                    height: 44px;
+                                    background: Math.mod(track, 2) == 0 ?
+                                        #1e1f22 : #1a1b1e;
+
+                                    Rectangle {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        background: transparent;
+
+                                        TouchArea {
+                                            x: 0px;
+                                            y: 0px;
+                                            width: parent.width;
+                                            height: parent.height;
+                                            clicked => {
+                                                root.seek-to(root.timeline-duration * self.mouse-x / max(self.width, 1px));
+                                            }
+                                        }
+
+                                        for clip in root.clips: Rectangle {
+                                            x: clip.track == track ? clip.start-seconds / max(root.timeline-duration, 0.001) * parent.width : 0px;
+                                            y: 6px;
+                                            width: clip.track == track ? max(clip.duration-seconds / max(root.timeline-duration, 0.001) * parent.width, 24px) : 0px;
+                                            height: clip.track == track ? 32px : 0px;
+                                            background: clip.track == track ? (root.selected-clip == clip.path ? Theme.blue : clip.color) : transparent;
+                                            border-radius: 3px;
+                                            property <float> drag-start-x: 0;
+                                            property <float> drag-start-time: clip.start-seconds;
+                                            property <bool> drag-did-move: false;
+
+                                            if clip.transition-in-seconds > 0: Rectangle {
+                                                width: min(parent.width / 2, clip.transition-in-seconds / max(clip.duration-seconds, 0.01) * parent.width);
+                                                height: 4px;
+                                                background: #e4bd68;
+                                            }
+                                            if clip.transition-out-seconds > 0: Rectangle {
+                                                x: parent.width - min(parent.width / 2, clip.transition-out-seconds / max(clip.duration-seconds, 0.01) * parent.width);
+                                                width: min(parent.width / 2, clip.transition-out-seconds / max(clip.duration-seconds, 0.01) * parent.width);
+                                                height: 4px;
+                                                background: #e4bd68;
+                                            }
+
+                                            Image {
+                                                source: clip.thumbnail-a;
+                                                image-fit: cover;
+                                                width: parent.width / 3;
+                                                height: parent.height;
+                                            }
+                                            Image {
+                                                source: clip.thumbnail-b;
+                                                image-fit: cover;
+                                                x: parent.width / 3;
+                                                width: parent.width / 3;
+                                                height: parent.height;
+                                            }
+                                            Image {
+                                                source: clip.thumbnail-c;
+                                                image-fit: cover;
+                                                x: parent.width * 2 / 3;
+                                                width: parent.width / 3;
+                                                height: parent.height;
+                                            }
+
+                                            if clip.track >= 2: Image {
+                                                source: clip.waveform;
+                                                image-fit: contain;
+                                                x: 4px;
+                                                y: 3px;
+                                                width: max(parent.width - 8px, 1px);
+                                                height: max(parent.height - 6px, 1px);
+                                            }
+
+                                            Text {
+                                                text: clip.name;
+                                                color: #f1f6ff;
+                                                font-size: 11px;
+                                                x: 8px;
+                                                width: max(parent.width - 16px, 8px);
+                                                vertical-alignment: center;
+                                                horizontal-alignment: left;
+                                                overflow: elide;
+                                            }
+
+                                            TouchArea {
+                                                clicked => {
+                                                root.selected-clip = clip.path;
+                                                root.select-clip(clip.path);
+                                                root.seek-to(clip.start-seconds + clip.duration-seconds * self.mouse-x / max(self.width, 1px));
+                                            }
+                                                changed pressed => {
+                                                    if (self.pressed) {
+                                                        root.begin-move-clip();
+                                                        parent.drag-start-x = self.mouse-x / 1px;
+                                                        parent.drag-start-time = clip.start-seconds;
+                                                        parent.drag-did-move = false;
+                                                        root.dragged-start-seconds = clip.start-seconds;
+                                                    } else {
+                                                        if (parent.drag-did-move) {
+                                                            root.move-clip(clip.path, root.dragged-start-seconds, track);
+                                                        }
+                                                        root.finish-move-clip();
+                                                    }
+                                                }
+                                                moved => {
+                                                    if (self.pressed) {
+                                                        parent.drag-did-move = true;
+                                                        root.dragged-start-seconds = max(0, parent.drag-start-time + (self.mouse-x / 1px - parent.drag-start-x) / max(root.timeline-canvas-width, 1) * root.timeline-duration);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if track == 1: Rectangle {
+                                        x: min(root.timeline-playhead-seconds / max(root.timeline-duration, 0.001) * parent.width, parent.width - 2px);
+                                        width: 2px;
+                                        height: parent.height;
+                                        background: #f4f7fc;
+                                        Rectangle {
+                                            x: -4px;
+                                            y: -1px;
+                                            width: 10px;
+                                            height: 8px;
+                                            background: #f4f7fc;
+                                            border-radius: 2px;
+                                        }
+                                    }
+
+                                    Divider { }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 24px;
+                    background: Theme.panel;
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+
+                        Text {
+                            text: root.clips.length + " media item(s)";
+                            color: Theme.muted;
+                            font-size: 10px;
+                            vertical-alignment: center;
+                        }
+
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            background: transparent;
+                        }
+
+                        Text {
+                            text: root.status-message;
+                            color: Theme.muted;
+                            font-size: 10px;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.active-mode != "Export": Divider { }
+
+        if root.active-mode != "Export": Rectangle {
+            height: 36px;
+            background: Theme.panel;
+
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 8px;
+
+                Text {
+                    text: "Workspace";
+                    color: Theme.muted;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+
+                LineEdit {
+                    text <=> root.layout-name;
+                }
+
+                FlatButton {
+                    label: root.show-project-panel ? "Project ✓" : "Project";
+                    compact: true;
+                    quiet: !root.show-project-panel;
+                    clicked => { root.show-project-panel = !root.show-project-panel; }
+                }
+
+                FlatButton {
+                    label: root.show-properties-panel ? "Properties ✓" : "Properties";
+                    compact: true;
+                    quiet: !root.show-properties-panel;
+                    clicked => { root.show-properties-panel = !root.show-properties-panel; }
+                }
+
+                FlatButton {
+                    label: root.show-effects-browser ? "Effects ✓" : "Effects";
+                    compact: true;
+                    quiet: !root.show-effects-browser;
+                    clicked => { root.show-effects-browser = !root.show-effects-browser; }
+                }
+
+                FlatButton {
+                    label: root.show-timeline ? "Timeline ✓" : "Timeline";
+                    compact: true;
+                    quiet: !root.show-timeline;
+                    clicked => { root.show-timeline = !root.show-timeline; }
+                }
+
+                if !root.compact-layout: Text { text: "Timeline size"; color: Theme.muted; font-size: 10px; vertical-alignment: center; }
+                if !root.compact-layout: Slider {
+                    width: 90px;
+                    minimum: 180;
+                    maximum: 420;
+                    value: root.timeline-height;
+                    changed(value) => { root.timeline-height = value; }
+                }
+
+                if !root.compact-layout: Text { text: "Left"; color: Theme.muted; font-size: 10px; vertical-alignment: center; }
+                if !root.compact-layout: Slider {
+                    width: 62px;
+                    minimum: 180;
+                    maximum: 320;
+                    value: root.left-panel-width;
+                    changed(value) => { root.left-panel-width = value; }
+                }
+
+                if !root.compact-layout: Text { text: "Right"; color: Theme.muted; font-size: 10px; vertical-alignment: center; }
+                if !root.compact-layout: Slider {
+                    width: 62px;
+                    minimum: 200;
+                    maximum: 360;
+                    value: root.right-panel-width;
+                    changed(value) => { root.right-panel-width = value; }
+                }
+
+                FlatButton {
+                    label: "Save layout";
+                    compact: true;
+                    clicked => { root.save-layout(root.layout-name); }
+                }
+
+                if !root.compact-layout: Rectangle {
+                    background: transparent;
+                    HorizontalLayout {
+                        spacing: 4px;
+                        for saved in root.custom-layouts: FlatButton {
+                            label: saved.name;
+                            compact: true;
+                            quiet: true;
+                            clicked => { root.load-layout(saved.name); }
+                        }
+                    }
+                }
+
+                if !root.compact-layout: FlatButton {
+                    label: "Editing preset";
+                    compact: true;
+                    quiet: true;
+                    clicked => {
+                        root.active-mode = "Editing";
+                        root.show-project-panel = true;
+                        root.show-properties-panel = true;
+                        root.show-effects-browser = false;
+                        root.show-timeline = true;
+                        root.timeline-height = 276;
+                        root.left-panel-width = 240;
+                        root.right-panel-width = 272;
+                        root.timeline-zoom = 1;
+                    }
+                }
+                if !root.compact-layout: FlatButton {
+                    label: "Color grade";
+                    compact: true;
+                    quiet: true;
+                    clicked => {
+                        root.active-mode = "Color";
+                        root.show-project-panel = true;
+                        root.show-properties-panel = true;
+                        root.show-effects-browser = false;
+                        root.show-timeline = true;
+                        root.timeline-height = 240;
+                        root.left-panel-width = 220;
+                        root.right-panel-width = 300;
+                        root.timeline-zoom = 1;
+                    }
+                }
+                if !root.compact-layout: FlatButton {
+                    label: "Effects lab";
+                    compact: true;
+                    quiet: true;
+                    clicked => {
+                        root.active-mode = "Effects";
+                        root.show-project-panel = true;
+                        root.show-properties-panel = true;
+                        root.show-effects-browser = true;
+                        root.show-timeline = true;
+                        root.timeline-height = 220;
+                        root.left-panel-width = 210;
+                        root.right-panel-width = 300;
+                        root.timeline-zoom = 1.25;
+                    }
+                }
+
+                FlatButton {
+                    label: "Reset";
+                    compact: true;
+                    quiet: true;
+                    clicked => { root.reset-layout(); }
+                }
+            }
+        }
+    }
+    KeyBinding {
+        keys: @keys(Space);
+        activated => { root.toggle-playback(); }
+    }
+    KeyBinding {
+        keys: @keys(Control + Z);
+        activated => { root.undo-edit(); }
+    }
+    KeyBinding {
+        keys: @keys(Control + Shift + Z);
+        activated => { root.redo-edit(); }
+    }
+    KeyBinding {
+        keys: @keys(Meta + Z);
+        activated => { root.undo-edit(); }
+    }
+    KeyBinding {
+        keys: @keys(Meta + Shift + Z);
+        activated => { root.redo-edit(); }
+    }
+    KeyBinding {
+        keys: @keys(Control + S);
+        activated => { root.save-project(); }
+    }
+    KeyBinding {
+        keys: @keys(Meta + S);
+        activated => { root.save-project(); }
+    }
+    KeyBinding {
+        keys: @keys(Control + O);
+        activated => { root.open-project(); }
+    }
+    KeyBinding {
+        keys: @keys(Meta + O);
+        activated => { root.open-project(); }
+    }
+    KeyBinding {
+        keys: @keys(Control + I);
+        activated => { root.import-media(); }
+    }
+    KeyBinding {
+        keys: @keys(Meta + I);
+        activated => { root.import-media(); }
+    }
+    KeyBinding {
+        keys: @keys(Delete);
+        activated => { root.remove-selected-clip(); }
+    }
+    }
+}
