@@ -7,12 +7,65 @@ use std::{
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::Instant,
 };
 
 static NEXT_RENDER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Video codec used for MP4 exports.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ExportVideoCodec {
+    /// H.264: widely compatible and the default.
+    #[default]
+    H264,
+    /// H.265/HEVC: smaller files at similar visual quality, with less universal support.
+    #[allow(dead_code)]
+    // Available to future export callers; UI wiring is intentionally out of scope.
+    H265,
+}
+
+/// Optional export controls. A missing bitrate preserves quality-based CRF encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExportRenderOptions {
+    pub frame_rate: u32,
+    pub video_codec: ExportVideoCodec,
+    /// Target video bitrate in kilobits per second. `None` uses the quality preset's CRF.
+    pub bitrate_kbps: Option<u32>,
+}
+
+impl Default for ExportRenderOptions {
+    fn default() -> Self {
+        Self {
+            frame_rate: 30,
+            video_codec: ExportVideoCodec::H264,
+            bitrate_kbps: None,
+        }
+    }
+}
+
+impl ExportRenderOptions {
+    pub(crate) fn validate(self) -> Result<Self, RenderError> {
+        if !(1..=120).contains(&self.frame_rate) {
+            return Err(RenderError(
+                "Export frame rate must be between 1 and 120 fps.".into(),
+            ));
+        }
+        if self
+            .bitrate_kbps
+            .is_some_and(|bitrate| !(64..=200_000).contains(&bitrate))
+        {
+            return Err(RenderError(
+                "Export video bitrate must be between 64 and 200000 kbps.".into(),
+            ));
+        }
+        Ok(self)
+    }
+}
 
 /// A real-time audio-only timeline mix. FFmpeg decodes and mixes every active
 /// audio clip, while ffplay sends the resulting PCM stream to the system audio
@@ -258,6 +311,8 @@ impl Drop for TimelineAudioPlayback {
 #[derive(Clone, Debug)]
 pub(crate) struct RenderClip {
     pub path: PathBuf,
+    /// Optional per-clip text overlay, rendered into the video during export.
+    pub title_text: String,
     pub duration: f32,
     pub start: f32,
     pub source_in: f32,
@@ -278,6 +333,12 @@ pub(crate) struct RenderClip {
     pub sharpen: f32,
     pub fade_in: f32,
     pub fade_out: f32,
+    /// Uniform scale around the frame center (1.0 is the original size).
+    pub scale: f32,
+    /// Clockwise rotation in degrees around the frame center.
+    pub rotation: f32,
+    pub animate_scale: bool,
+    pub scale_end: f32,
 }
 
 #[derive(Debug)]
@@ -295,6 +356,104 @@ pub(crate) struct AudioMeterSnapshot {
     pub master: AudioLevel,
 }
 
+/// Interpolation used from a keyframe to the next keyframe.
+#[allow(dead_code)] // The editor integration is a follow-up to this isolated model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum KeyframeInterpolation {
+    /// Keep the current value until the next keyframe.
+    Hold,
+    /// Blend at a constant rate.
+    #[default]
+    Linear,
+    /// Smoothstep easing with zero slope at both ends.
+    EaseInOut,
+}
+
+/// A scalar value at a timeline time, with the interpolation for the segment
+/// that starts at this keyframe.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Keyframe {
+    pub time: f32,
+    pub value: f32,
+    pub interpolation: KeyframeInterpolation,
+}
+
+/// Validated, ordered keyframes for animating a single numeric property.
+/// Times are timeline seconds and must be finite, non-negative, and strictly
+/// increasing. Values must be finite; property-specific bounds belong to the
+/// caller so this model can also animate unbounded values such as position.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct KeyframeTrack {
+    keyframes: Vec<Keyframe>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyframeError {
+    Empty,
+    InvalidTime,
+    InvalidValue,
+    TimesNotIncreasing,
+}
+
+#[allow(dead_code)]
+impl KeyframeTrack {
+    pub(crate) fn new(keyframes: Vec<Keyframe>) -> Result<Self, KeyframeError> {
+        if keyframes.is_empty() {
+            return Err(KeyframeError::Empty);
+        }
+        let mut previous_time = None;
+        for keyframe in &keyframes {
+            if !keyframe.time.is_finite() || keyframe.time < 0.0 {
+                return Err(KeyframeError::InvalidTime);
+            }
+            if !keyframe.value.is_finite() {
+                return Err(KeyframeError::InvalidValue);
+            }
+            if previous_time.is_some_and(|previous| keyframe.time <= previous) {
+                return Err(KeyframeError::TimesNotIncreasing);
+            }
+            previous_time = Some(keyframe.time);
+        }
+        Ok(Self { keyframes })
+    }
+
+    pub(crate) fn keyframes(&self) -> &[Keyframe] {
+        &self.keyframes
+    }
+
+    /// Evaluate the track at a timeline time. Before/after the keyed range,
+    /// the nearest endpoint value is held. Non-finite query times return None.
+    pub(crate) fn value_at(&self, time: f32) -> Option<f32> {
+        if !time.is_finite() {
+            return None;
+        }
+        let first = *self.keyframes.first()?;
+        let last = *self.keyframes.last()?;
+        if time <= first.time {
+            return Some(first.value);
+        }
+        if time >= last.time {
+            return Some(last.value);
+        }
+
+        let right_index = self
+            .keyframes
+            .partition_point(|keyframe| keyframe.time < time);
+        let left = self.keyframes[right_index - 1];
+        let right = self.keyframes[right_index];
+        let progress = ((time - left.time) / (right.time - left.time)).clamp(0.0, 1.0);
+        let progress = match left.interpolation {
+            KeyframeInterpolation::Hold => 0.0,
+            KeyframeInterpolation::Linear => progress,
+            KeyframeInterpolation::EaseInOut => progress * progress * (3.0 - 2.0 * progress),
+        };
+        Some(left.value + (right.value - left.value) * progress)
+    }
+}
+
 impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -305,6 +464,43 @@ impl std::error::Error for RenderError {}
 
 fn fmt_seconds(value: f32) -> String {
     format!("{value:.6}")
+}
+
+fn escape_drawtext(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '\'' | ':' | ',' | ';' | '[' | ']' | '%') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+fn ensure_title_filter_available(clips: &[RenderClip]) -> Result<(), RenderError> {
+    if !clips
+        .iter()
+        .any(|clip| clip.track <= 1 && !clip.title_text.trim().is_empty())
+    {
+        return Ok(());
+    }
+    static HAS_DRAWTEXT: OnceLock<bool> = OnceLock::new();
+    let available = *HAS_DRAWTEXT.get_or_init(|| {
+        Command::new("ffmpeg")
+            .args(["-hide_banner", "-filters"])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("drawtext")
+            })
+    });
+    if available {
+        Ok(())
+    } else {
+        Err(RenderError(
+            "Title overlays need an FFmpeg build with the drawtext filter (FreeType enabled). Install a full FFmpeg build or clear the selected clip's title.".into(),
+        ))
+    }
 }
 
 pub(crate) fn has_audio(path: &Path) -> bool {
@@ -429,9 +625,10 @@ fn build_filter_graph(
     duration: f32,
     width: u32,
     height: u32,
+    frame_rate: u32,
 ) -> String {
     let mut graph = format!(
-        "color=c=black:s={width}x{height}:r=30:d={}[base0]",
+        "color=c=black:s={width}x{height}:r={frame_rate}:d={}[base0]",
         fmt_seconds(duration),
     );
     let mut video_clips: Vec<(usize, &RenderClip)> = clips
@@ -466,6 +663,27 @@ fn build_filter_graph(
             ",format=rgba,colorchannelmixer=aa={}",
             clip.opacity.clamp(0.0, 1.0)
         ));
+        if clip.animate_scale {
+            filters.push_str(&format!(
+                ",fps={frame_rate},zoompan=z='({:.4})+(({})-({:.4}))*on/({}*{frame_rate})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={width}x{height}:fps={frame_rate}",
+                clip.scale.clamp(0.25, 3.0),
+                clip.scale_end.clamp(0.25, 3.0),
+                clip.scale.clamp(0.25, 3.0),
+                fmt_seconds(clip.duration),
+            ));
+        } else if (clip.scale - 1.0).abs() > 0.001 {
+            filters.push_str(&format!(
+                ",scale=trunc(iw*{:.4}/2)*2:trunc(ih*{:.4}/2)*2:eval=init,pad=max(iw\\,{width}):max(ih\\,{height}):(ow-iw)/2:(oh-ih)/2,crop={width}:{height}",
+                clip.scale.clamp(0.25, 3.0),
+                clip.scale.clamp(0.25, 3.0),
+            ));
+        }
+        if clip.rotation.abs() > 0.001 {
+            filters.push_str(&format!(
+                ",rotate={:.6}*PI/180:ow={width}:oh={height}:c=black@0",
+                clip.rotation.clamp(-180.0, 180.0),
+            ));
+        }
         if clip.fade_in > 0.001 {
             filters.push_str(&format!(
                 ",fade=t=in:st=0:d={}:alpha=1",
@@ -500,6 +718,19 @@ fn build_filter_graph(
         graph.push_str(&format!(
             ";[base{base_index}][{label}]overlay=0:0:eof_action=pass:shortest=0:format=auto:enable='between(t,{},{})'[{next_base}]",
             fmt_seconds(clip.start), fmt_seconds(clip.start + clip.duration)
+        ));
+        base_index += 1;
+    }
+    for (_, clip) in &video_clips {
+        if clip.title_text.trim().is_empty() {
+            continue;
+        }
+        let next_base = format!("base{}", base_index + 1);
+        graph.push_str(&format!(
+            ";[base{base_index}]drawtext=text='{}':fontsize=h/18:fontcolor=white:borderw=2:bordercolor=black@0.75:x=(w-text_w)/2:y=h-text_h-48:enable='between(t,{},{})'[{next_base}]",
+            escape_drawtext(clip.title_text.trim()),
+            fmt_seconds(clip.start),
+            fmt_seconds(clip.start + clip.duration),
         ));
         base_index += 1;
     }
@@ -588,6 +819,8 @@ pub(crate) fn render_preview_frame(
         })
         .map(|(index, clip)| (index, clip.clone()))
         .collect();
+    let active_clips: Vec<RenderClip> = active.iter().map(|(_, clip)| clip.clone()).collect();
+    ensure_title_filter_available(&active_clips)?;
 
     // The export graph paints lower tracks first and later clips over earlier
     // clips on the same track. Keep that original ordering in this snapshot.
@@ -634,6 +867,7 @@ pub(crate) fn render_preview_frame(
         FRAME_WINDOW,
         WIDTH,
         HEIGHT,
+        30,
     );
     let mut command = Command::new("ffmpeg");
     command.args([
@@ -829,14 +1063,42 @@ pub(crate) fn render_mp4_with_progress(
     render_mp4_with_options(clips, output, 1920, 1080, "High", on_progress)
 }
 
+#[allow(dead_code)] // Kept as a backward-compatible entry point for existing callers.
 pub(crate) fn render_mp4_with_options(
     clips: &[RenderClip],
     output: &Path,
     requested_width: u32,
     requested_height: u32,
     quality: &str,
+    on_progress: impl FnMut(f32),
+) -> Result<(), RenderError> {
+    render_mp4_with_export_options(
+        clips,
+        output,
+        requested_width,
+        requested_height,
+        quality,
+        ExportRenderOptions {
+            frame_rate: 30,
+            ..ExportRenderOptions::default()
+        },
+        on_progress,
+    )
+}
+
+/// Render with explicit frame-rate, codec, and optional target bitrate controls.
+/// Existing callers can keep using `render_mp4_with_options` and retain its defaults.
+pub(crate) fn render_mp4_with_export_options(
+    clips: &[RenderClip],
+    output: &Path,
+    requested_width: u32,
+    requested_height: u32,
+    quality: &str,
+    options: ExportRenderOptions,
     mut on_progress: impl FnMut(f32),
 ) -> Result<(), RenderError> {
+    let options = options.validate()?;
+    ensure_title_filter_available(clips)?;
     let duration = validate(clips)?;
     let output_parent = output
         .parent()
@@ -872,12 +1134,24 @@ pub(crate) fn render_mp4_with_options(
         .map(|(index, _)| index)
         .collect();
     let audio_inputs = active_audio_inputs(clips, &audio_candidates);
-    let graph = build_filter_graph(clips, &video_inputs, &audio_inputs, duration, width, height);
+    let graph = build_filter_graph(
+        clips,
+        &video_inputs,
+        &audio_inputs,
+        duration,
+        width,
+        height,
+        options.frame_rate,
+    );
     let mut command = Command::new("ffmpeg");
     let (preset, crf) = match quality {
         "Draft" => ("ultrafast", "28"),
         "Standard" => ("fast", "23"),
         _ => ("medium", "18"),
+    };
+    let (codec, preset) = match options.video_codec {
+        ExportVideoCodec::H264 => ("libx264", preset),
+        ExportVideoCodec::H265 => ("libx265", preset),
     };
     command.args([
         "-hide_banner",
@@ -904,18 +1178,21 @@ pub(crate) fn render_mp4_with_options(
         "-t",
         &fmt_seconds(duration),
         "-frames:v",
-        &((duration * 30.0).ceil().max(1.0) as u64).to_string(),
+        &((duration * options.frame_rate as f32).ceil().max(1.0) as u64).to_string(),
         "-c:v",
-        "libx264",
+        codec,
         "-preset",
         preset,
-        "-crf",
-        crf,
         "-pix_fmt",
         "yuv420p",
         "-movflags",
         "+faststart",
     ]);
+    if let Some(bitrate_kbps) = options.bitrate_kbps {
+        command.args(["-b:v", &format!("{bitrate_kbps}k")]);
+    } else {
+        command.args(["-crf", crf]);
+    }
     if !audio_inputs.is_empty() {
         command.args(["-c:a", "aac", "-b:a", "192k"]);
     }
@@ -1012,6 +1289,7 @@ mod tests {
     fn clip(track: i32, start: f32) -> RenderClip {
         RenderClip {
             path: PathBuf::from("media.mp4"),
+            title_text: String::new(),
             duration: 4.0,
             start,
             source_in: 1.0,
@@ -1030,6 +1308,10 @@ mod tests {
             sharpen: 0.0,
             fade_in: 0.5,
             fade_out: 0.5,
+            scale: 1.0,
+            rotation: 0.0,
+            animate_scale: false,
+            scale_end: 1.0,
         }
     }
 
@@ -1042,14 +1324,155 @@ mod tests {
     }
 
     #[test]
+    fn export_options_validate_frame_rate_and_bitrate() {
+        assert_eq!(
+            ExportRenderOptions::default()
+                .validate()
+                .unwrap()
+                .frame_rate,
+            30
+        );
+        assert!(
+            ExportRenderOptions {
+                frame_rate: 0,
+                ..ExportRenderOptions::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ExportRenderOptions {
+                frame_rate: 121,
+                ..ExportRenderOptions::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ExportRenderOptions {
+                bitrate_kbps: Some(63),
+                ..ExportRenderOptions::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ExportRenderOptions {
+                bitrate_kbps: Some(10_000),
+                ..ExportRenderOptions::default()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    fn key(time: f32, value: f32, interpolation: KeyframeInterpolation) -> Keyframe {
+        Keyframe {
+            time,
+            value,
+            interpolation,
+        }
+    }
+
+    #[test]
+    fn keyframe_track_interpolates_linear_values_and_holds_endpoints() {
+        let track = KeyframeTrack::new(vec![
+            key(1.0, 10.0, KeyframeInterpolation::Linear),
+            key(3.0, 30.0, KeyframeInterpolation::Linear),
+        ])
+        .unwrap();
+
+        assert_eq!(track.value_at(0.0), Some(10.0));
+        assert_eq!(track.value_at(1.0), Some(10.0));
+        assert_eq!(track.value_at(2.0), Some(20.0));
+        assert_eq!(track.value_at(3.0), Some(30.0));
+        assert_eq!(track.value_at(9.0), Some(30.0));
+        assert_eq!(track.value_at(f32::NAN), None);
+        assert_eq!(track.value_at(f32::INFINITY), None);
+        assert_eq!(track.keyframes().len(), 2);
+    }
+
+    #[test]
+    fn keyframe_track_supports_hold_and_smoothstep_easing() {
+        let hold = KeyframeTrack::new(vec![
+            key(0.0, 2.0, KeyframeInterpolation::Hold),
+            key(2.0, 8.0, KeyframeInterpolation::Linear),
+        ])
+        .unwrap();
+        assert_eq!(hold.value_at(1.5), Some(2.0));
+        assert_eq!(hold.value_at(2.0), Some(8.0));
+
+        let eased = KeyframeTrack::new(vec![
+            key(0.0, 0.0, KeyframeInterpolation::EaseInOut),
+            key(2.0, 10.0, KeyframeInterpolation::Linear),
+        ])
+        .unwrap();
+        assert_eq!(eased.value_at(1.0), Some(5.0));
+        assert_eq!(eased.value_at(0.5), Some(1.5625));
+    }
+
+    #[test]
+    fn keyframe_track_rejects_empty_non_finite_or_unordered_keys() {
+        assert_eq!(
+            KeyframeTrack::new(vec![]).unwrap_err(),
+            KeyframeError::Empty
+        );
+        assert_eq!(
+            KeyframeTrack::new(vec![key(-1.0, 0.0, KeyframeInterpolation::Linear)]).unwrap_err(),
+            KeyframeError::InvalidTime
+        );
+        assert_eq!(
+            KeyframeTrack::new(vec![key(f32::NAN, 0.0, KeyframeInterpolation::Linear)])
+                .unwrap_err(),
+            KeyframeError::InvalidTime
+        );
+        assert_eq!(
+            KeyframeTrack::new(vec![key(0.0, f32::INFINITY, KeyframeInterpolation::Linear)])
+                .unwrap_err(),
+            KeyframeError::InvalidValue
+        );
+        assert_eq!(
+            KeyframeTrack::new(vec![
+                key(1.0, 0.0, KeyframeInterpolation::Linear),
+                key(1.0, 1.0, KeyframeInterpolation::Linear),
+            ])
+            .unwrap_err(),
+            KeyframeError::TimesNotIncreasing
+        );
+        assert_eq!(
+            KeyframeTrack::new(vec![
+                key(2.0, 0.0, KeyframeInterpolation::Linear),
+                key(1.0, 1.0, KeyframeInterpolation::Linear),
+            ])
+            .unwrap_err(),
+            KeyframeError::TimesNotIncreasing
+        );
+    }
+
+    #[test]
+    fn drawtext_escapes_filter_syntax_and_keeps_unicode() {
+        assert_eq!(
+            escape_drawtext("Hello: 50%, it's [fine];\\ok"),
+            "Hello\\: 50\\%\\, it\\'s \\[fine\\]\\;\\\\ok"
+        );
+        assert_eq!(escape_drawtext("سلام دنیا"), "سلام دنیا");
+    }
+
+    #[test]
     fn graph_composites_video_tracks_and_mixes_audio() {
         let clips = vec![clip(1, 0.0), clip(0, 2.0), clip(2, 1.0), clip(3, 3.0)];
-        let graph = build_filter_graph(&clips, &[0, 1], &[0, 1, 2, 3], 7.0, 1920, 1080);
+        let graph = build_filter_graph(&clips, &[0, 1], &[0, 1, 2, 3], 7.0, 1920, 1080, 30);
         assert!(graph.contains("overlay=0:0"));
         assert!(graph.contains("between(t,2.000000,6.000000)"));
         assert!(graph.contains("amix=inputs=4"));
         assert!(graph.contains("[vout]"));
         assert!(graph.contains("[aout]"));
+        let graph_60fps = build_filter_graph(&clips, &[0, 1], &[], 7.0, 1920, 1080, 60);
+        assert!(graph_60fps.contains("color=c=black:s=1920x1080:r=60:d=7.000000"));
+        let mut titled = clip(0, 0.0);
+        titled.title_text = "Opening title".into();
+        let title_graph = build_filter_graph(&[titled], &[0], &[], 4.0, 1920, 1080, 30);
+        assert!(title_graph.contains("drawtext=text='Opening title'"));
     }
 
     #[test]
@@ -1061,7 +1484,7 @@ mod tests {
         video.opacity = 0.8;
         video.blur = 2.0;
         video.sharpen = 1.5;
-        let graph = build_filter_graph(&[video], &[0], &[], 4.0, 1920, 1080);
+        let graph = build_filter_graph(&[video], &[0], &[], 4.0, 1920, 1080, 30);
         assert!(graph.contains("trim=start=1.000000:duration=4.000000"));
         assert!(graph.contains("brightness=0.25:contrast=1.25:saturation=0.75"));
         assert!(graph.contains("colorchannelmixer=aa=0.8"));
@@ -1076,7 +1499,7 @@ mod tests {
         let outgoing = clip(1, 0.0);
         let mut incoming = clip(0, 2.0);
         incoming.fade_in = 0.0;
-        let graph = build_filter_graph(&[outgoing, incoming], &[0, 1], &[], 6.0, 1920, 1080);
+        let graph = build_filter_graph(&[outgoing, incoming], &[0, 1], &[], 6.0, 1920, 1080, 30);
         assert!(graph.contains("fade=t=out:st=3.500000:d=0.500000:alpha=1"));
     }
 
@@ -1084,7 +1507,7 @@ mod tests {
     fn audio_gain_is_converted_from_decibels_to_linear_volume() {
         let mut audio = clip(2, 0.0);
         audio.audio_gain_db = -6.0;
-        let graph = build_filter_graph(&[audio], &[], &[0], 4.0, 1920, 1080);
+        let graph = build_filter_graph(&[audio], &[], &[0], 4.0, 1920, 1080, 30);
         assert!(graph.contains("volume=0.501187"));
     }
 
@@ -1106,14 +1529,14 @@ mod tests {
         let mut audio = clip(2, 0.0);
         audio.audio_gain_db = -6.0;
         audio.track_gain_db = 6.0;
-        let graph = build_filter_graph(&[audio], &[], &[0], 4.0, 1920, 1080);
+        let graph = build_filter_graph(&[audio], &[], &[0], 4.0, 1920, 1080, 30);
         assert!(graph.contains("volume=1.000000"));
     }
 
     #[test]
     fn graph_does_not_treat_audio_only_media_as_video() {
         let clips = vec![clip(1, 0.0), clip(1, 1.0)];
-        let graph = build_filter_graph(&clips, &[0], &[1], 5.0, 1920, 1080);
+        let graph = build_filter_graph(&clips, &[0], &[1], 5.0, 1920, 1080, 30);
         assert!(graph.contains("[0:v:0]"));
         assert!(!graph.contains("[1:v:0]"));
         assert!(graph.contains("[1:a:0]"));
@@ -1216,6 +1639,7 @@ mod tests {
         let clips = vec![
             RenderClip {
                 path: red,
+                title_text: String::new(),
                 duration: 1.0,
                 start: 0.0,
                 source_in: 0.0,
@@ -1234,9 +1658,14 @@ mod tests {
                 sharpen: 0.0,
                 fade_in: 0.0,
                 fade_out: 0.0,
+                scale: 1.1,
+                rotation: 0.0,
+                animate_scale: false,
+                scale_end: 1.1,
             },
             RenderClip {
                 path: blue,
+                title_text: String::new(),
                 duration: 1.0,
                 start: 0.5,
                 source_in: 0.0,
@@ -1255,6 +1684,10 @@ mod tests {
                 sharpen: 0.5,
                 fade_in: 0.1,
                 fade_out: 0.1,
+                scale: 1.0,
+                rotation: 5.0,
+                animate_scale: true,
+                scale_end: 1.2,
             },
         ];
         let preview_frame = root.join("preview.png");

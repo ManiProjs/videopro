@@ -1,13 +1,15 @@
 mod gpu_preview;
 mod player;
+mod proxy;
 mod render;
+mod sequence;
 
 use gpu_preview::GpuPreview;
 use player::VideoPlayer;
 use slint::{Image, Model, Timer, TimerMode, wgpu_30};
 use std::{
     cell::{Cell, RefCell},
-    collections::hash_map::DefaultHasher,
+    collections::{HashMap, hash_map::DefaultHasher},
     fs,
     hash::{Hash, Hasher},
     io::{Read, Write},
@@ -118,12 +120,14 @@ fn clear_timeline_clock(clock: &Arc<Mutex<Option<(f32, Instant)>>>) {
 fn render_clip_snapshot(ui: &EditorWindow) -> Vec<render::RenderClip> {
     let tracks = audio_track_settings(ui);
     let any_solo = tracks.iter().any(|track| track.solo);
-    ui.get_clips()
+    let clips: Vec<render::RenderClip> = ui
+        .get_clips()
         .iter()
         .map(|clip| {
             let track = tracks[clip.track.clamp(0, 3) as usize];
             render::RenderClip {
                 path: PathBuf::from(clip.path.as_str()),
+                title_text: clip.title_text.to_string(),
                 duration: clip.duration_seconds,
                 start: clip.start_seconds,
                 source_in: clip.source_in_seconds,
@@ -142,9 +146,36 @@ fn render_clip_snapshot(ui: &EditorWindow) -> Vec<render::RenderClip> {
                 sharpen: clip.sharpen,
                 fade_in: clip.transition_in_seconds,
                 fade_out: clip.transition_out_seconds,
+                scale: clip.scale,
+                rotation: clip.rotation,
+                animate_scale: clip.animate_scale,
+                scale_end: clip.scale_end,
             }
         })
-        .collect()
+        .collect();
+    // Represent the current flat timeline as the implicit root sequence. Once
+    // the sequence UI is available, nested placements resolve through this same
+    // flattening boundary before preview, meters, and export consume snapshots.
+    let root = sequence::Sequence {
+        id: "root".to_owned(),
+        items: clips
+            .iter()
+            .cloned()
+            .map(sequence::SequenceItem::Clip)
+            .collect(),
+    };
+    sequence::flatten("root", &HashMap::from([("root".to_owned(), root)])).unwrap_or(clips)
+}
+
+/// Prefer a generated proxy for interactive preview only. Export snapshots keep
+/// the original media path so proxy quality never limits final output.
+fn preview_media_path(source: &str) -> String {
+    proxy::proxy_path_for(source)
+        .ok()
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from(source))
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn render_snapshot_signature(clips: &[render::RenderClip]) -> u64 {
@@ -223,6 +254,7 @@ fn decode_name(encoded: &str) -> Option<String> {
 #[derive(Clone)]
 struct ProjectClipData {
     name: String,
+    title_text: String,
     source_path: String,
     duration_seconds: f32,
     start_seconds: f32,
@@ -238,6 +270,10 @@ struct ProjectClipData {
     sharpen: f32,
     transition_in_seconds: f32,
     transition_out_seconds: f32,
+    scale: f32,
+    rotation: f32,
+    animate_scale: bool,
+    scale_end: f32,
 }
 
 fn apply_clip_preview_settings(
@@ -410,7 +446,7 @@ fn save_project_bundle(
     let file = fs::File::create(&temporary)?;
     let mut archive = ZipWriter::new(file);
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-    let mut manifest = format!("VIDEOPRO_BUNDLE\t4\nNAME\t{}\n", encode_name(project_name));
+    let mut manifest = format!("VIDEOPRO_BUNDLE\t7\nNAME\t{}\n", encode_name(project_name));
     for (index, track) in tracks.iter().enumerate() {
         manifest.push_str(&format!(
             "TRACK\t{index}\t{:.6}\t{}\t{}\n",
@@ -427,7 +463,7 @@ fn save_project_bundle(
         let mut input = fs::File::open(source)?;
         std::io::copy(&mut input, &mut archive)?;
         manifest.push_str(&format!(
-            "CLIP\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\n",
+            "CLIP\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{}\t{:.6}\n",
             encode_name(&clip.name),
             encode_name(&clip.source_path),
             encode_name(&archive_path),
@@ -445,6 +481,11 @@ fn save_project_bundle(
             clip.audio_gain_db,
             clip.blur,
             clip.sharpen,
+            encode_name(&clip.title_text),
+            clip.scale,
+            clip.rotation,
+            u8::from(clip.animate_scale),
+            clip.scale_end,
         ));
     }
 
@@ -532,6 +573,9 @@ fn load_project_bundle_into(
         Some("VIDEOPRO_BUNDLE\t2") => 2,
         Some("VIDEOPRO_BUNDLE\t3") => 3,
         Some("VIDEOPRO_BUNDLE\t4") => 4,
+        Some("VIDEOPRO_BUNDLE\t5") => 5,
+        Some("VIDEOPRO_BUNDLE\t6") => 6,
+        Some("VIDEOPRO_BUNDLE\t7") => 7,
         _ => return Err("Unsupported VideoPro project version".to_owned()),
     };
     let project_name = lines
@@ -601,8 +645,14 @@ fn load_project_bundle_into(
                     6
                 } else if version == 2 {
                     15
-                } else {
+                } else if version <= 4 {
                     18
+                } else if version == 5 {
+                    19
+                } else if version == 6 {
+                    21
+                } else {
+                    23
                 }
             {
                 return Err(format!("Malformed clip entry {}", index + 1));
@@ -665,6 +715,27 @@ fn load_project_bundle_into(
             } else {
                 (0.0, 0.0, 0.0)
             };
+            let title_text = if version >= 5 {
+                decode_name(fields[18])
+                    .ok_or_else(|| "Invalid title text in project manifest".to_owned())?
+            } else {
+                String::new()
+            };
+            let (scale, rotation) = if version >= 6 {
+                (number(19)?, number(20)?)
+            } else {
+                (1.0, 0.0)
+            };
+            let (animate_scale, scale_end) = if version >= 7 {
+                let animated = match fields[21] {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err("Invalid scale animation flag in manifest".to_owned()),
+                };
+                (animated, number(22)?)
+            } else {
+                (false, scale)
+            };
             if duration <= 0.0
                 || start < 0.0
                 || source_in < 0.0
@@ -680,6 +751,9 @@ fn load_project_bundle_into(
                 || !(-24.0..=12.0).contains(&audio_gain_db)
                 || !(0.0..=10.0).contains(&blur)
                 || !(0.0..=5.0).contains(&sharpen)
+                || !(0.25..=3.0).contains(&scale)
+                || !(-180.0..=180.0).contains(&rotation)
+                || !(0.25..=3.0).contains(&scale_end)
             {
                 return Err("Invalid clip timing in project manifest".to_owned());
             }
@@ -743,6 +817,7 @@ fn load_project_bundle_into(
             }
             clips.push(ProjectClipData {
                 name,
+                title_text,
                 source_path: extracted_path.to_string_lossy().into_owned(),
                 duration_seconds: duration,
                 start_seconds: start,
@@ -758,6 +833,10 @@ fn load_project_bundle_into(
                 sharpen,
                 transition_in_seconds: transition_in,
                 transition_out_seconds: transition_out,
+                scale,
+                rotation,
+                animate_scale,
+                scale_end,
             });
         }
         Ok(())
@@ -1005,6 +1084,7 @@ fn configure_editor(
                 .iter()
                 .map(|clip| ProjectClipData {
                     name: clip.name.to_string(),
+                    title_text: clip.title_text.to_string(),
                     source_path: clip.path.to_string(),
                     duration_seconds: clip.duration_seconds,
                     start_seconds: clip.start_seconds,
@@ -1020,6 +1100,10 @@ fn configure_editor(
                     sharpen: clip.sharpen,
                     transition_in_seconds: clip.transition_in_seconds,
                     transition_out_seconds: clip.transition_out_seconds,
+                    scale: clip.scale,
+                    rotation: clip.rotation,
+                    animate_scale: clip.animate_scale,
+                    scale_end: clip.scale_end,
                 })
                 .collect();
             ui.set_status_message(format!("Packaging {} media file(s)…", clips.len()).into());
@@ -1169,6 +1253,7 @@ fn configure_editor(
                         end = end.max(saved.start_seconds + duration_seconds);
                         clips.push(Clip {
                             name: saved.name.into(),
+                            title_text: saved.title_text.into(),
                             path: path.into(),
                             duration: format_time(duration_seconds as f64).into(),
                             duration_seconds,
@@ -1185,6 +1270,10 @@ fn configure_editor(
                             sharpen: saved.sharpen,
                             transition_in_seconds: saved.transition_in_seconds,
                             transition_out_seconds: saved.transition_out_seconds,
+                            scale: saved.scale,
+                            rotation: saved.rotation,
+                            animate_scale: saved.animate_scale,
+                            scale_end: saved.scale_end,
                             thumbnail_a: thumbnails[0]
                                 .as_ref()
                                 .and_then(|p| Image::load_from_path(p).ok())
@@ -1313,6 +1402,7 @@ fn configure_editor(
                         next_start_by_track[track as usize] += clip.duration_seconds;
                         Clip {
                             name: clip.name.into(),
+                            title_text: "".into(),
                             path: clip.path.into(),
                             duration: clip.duration.into(),
                             duration_seconds: clip.duration_seconds,
@@ -1329,6 +1419,10 @@ fn configure_editor(
                             sharpen: 0.0,
                             transition_in_seconds: 0.0,
                             transition_out_seconds: 0.0,
+                            scale: 1.0,
+                            rotation: 0.0,
+                            animate_scale: false,
+                            scale_end: 1.0,
                             thumbnail_a: clip.thumbnails[0]
                                 .as_ref()
                                 .and_then(|path| Image::load_from_path(path).ok())
@@ -1375,7 +1469,8 @@ fn configure_editor(
                 return;
             };
 
-            match player.load(path.as_str()) {
+            let preview_path = preview_media_path(path.as_str());
+            match player.load(preview_path.as_str()) {
                 Ok(()) => {
                     ui.set_selected_clip(path);
                     if let Some(clip) = ui
@@ -1390,6 +1485,7 @@ fn configure_editor(
                             format_time(clip.source_out_seconds as f64).into(),
                         );
                         ui.set_edit_trim_in(clip.source_in_seconds);
+                        ui.set_edit_title_text(clip.title_text.to_string().into());
                         ui.set_edit_trim_out(clip.source_out_seconds);
                         ui.set_edit_track(clip.track);
                         ui.set_edit_exposure(clip.exposure);
@@ -1401,6 +1497,10 @@ fn configure_editor(
                         ui.set_edit_sharpen(clip.sharpen);
                         ui.set_edit_transition_in(clip.transition_in_seconds);
                         ui.set_edit_transition_out(clip.transition_out_seconds);
+                        ui.set_edit_scale(clip.scale);
+                        ui.set_edit_rotation(clip.rotation);
+                        ui.set_edit_animate_scale(clip.animate_scale);
+                        ui.set_edit_scale_end(clip.scale_end);
                         apply_clip_preview_settings(&player, &clip, &audio_track_settings(&ui));
                         file_ready.set(false);
                         pending_local.set(Some(clip.source_in_seconds as f64));
@@ -1413,6 +1513,50 @@ fn configure_editor(
                     ui.set_status_message(format!("Could not load video: {error}").into());
                 }
             }
+        }
+    });
+
+    editor.on_generate_proxy({
+        let weak = editor.as_weak();
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let selected = ui.get_selected_clip().to_string();
+            if selected.is_empty() {
+                ui.set_status_message("Select a clip before generating a proxy".into());
+                return;
+            }
+            ui.set_status_message("Generating preview proxy…".into());
+            let weak = weak.clone();
+            let selected_for_reload = selected.clone();
+            thread::spawn(move || {
+                let result = proxy::create_proxy(&selected);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = weak.upgrade() {
+                        match result {
+                            Ok(proxy) => {
+                                ui.invoke_select_clip(selected_for_reload.into());
+                                ui.set_status_message(
+                                    format!(
+                                        "Proxy {} · {}",
+                                        if proxy.reused { "reused" } else { "ready" },
+                                        proxy
+                                            .proxy_path
+                                            .file_name()
+                                            .and_then(|name| name.to_str())
+                                            .unwrap_or("proxy.mp4")
+                                    )
+                                    .into(),
+                                );
+                            }
+                            Err(error) => {
+                                ui.set_status_message(format!("Proxy failed: {error}").into())
+                            }
+                        }
+                    }
+                });
+            });
         }
     });
 
@@ -1443,6 +1587,7 @@ fn configure_editor(
                 .clamp(source_in + 0.05, source_duration);
             let duration = (source_out - source_in).max(0.05);
             let clip = &mut clips[index];
+            clip.title_text = ui.get_edit_title_text().to_string().into();
             clip.source_in_seconds = source_in;
             clip.source_out_seconds = source_out;
             clip.duration_seconds = duration;
@@ -1457,6 +1602,10 @@ fn configure_editor(
             clip.sharpen = ui.get_edit_sharpen().clamp(0.0, 5.0);
             clip.transition_in_seconds = ui.get_edit_transition_in().clamp(0.0, duration / 2.0);
             clip.transition_out_seconds = ui.get_edit_transition_out().clamp(0.0, duration / 2.0);
+            clip.scale = ui.get_edit_scale().clamp(0.25, 3.0);
+            clip.rotation = ui.get_edit_rotation().clamp(-180.0, 180.0);
+            clip.animate_scale = ui.get_edit_animate_scale();
+            clip.scale_end = ui.get_edit_scale_end().clamp(0.25, 3.0);
             let _ = player
                 .engine
                 .set_property("brightness", clip.exposure as f64);
@@ -1467,6 +1616,7 @@ fn configure_editor(
                 .engine
                 .set_property("saturation", ((clip.saturation - 1.0) * 100.0) as f64);
             let changed = old.source_in_seconds != clip.source_in_seconds
+                || old.title_text != clip.title_text
                 || old.source_out_seconds != clip.source_out_seconds
                 || old.track != clip.track
                 || old.exposure != clip.exposure
@@ -1478,6 +1628,11 @@ fn configure_editor(
                 || old.sharpen != clip.sharpen
                 || old.transition_in_seconds != clip.transition_in_seconds
                 || old.transition_out_seconds != clip.transition_out_seconds;
+            let changed = changed
+                || old.scale != clip.scale
+                || old.rotation != clip.rotation
+                || old.animate_scale != clip.animate_scale
+                || old.scale_end != clip.scale_end;
             if !changed {
                 return;
             }
@@ -1800,7 +1955,8 @@ fn configure_editor(
             let still_loading_selected = !needs_load && !file_ready.get();
             let result = if needs_load {
                 file_ready.set(false);
-                player.load(clip.path.as_str())
+                let preview_path = preview_media_path(clip.path.as_str());
+                player.load(preview_path.as_str())
             } else if still_loading_selected {
                 // Selecting a clip starts an asynchronous load. A click/seek
                 // in the timeline can arrive before mpv's Loaded event; defer
@@ -1860,6 +2016,19 @@ fn configure_editor(
             let export_width = ui.get_export_width().clamp(1280, 3840) as u32;
             let export_height = ui.get_export_height().clamp(720, 2160) as u32;
             let export_quality = ui.get_export_quality().to_string();
+            let export_options = render::ExportRenderOptions {
+                frame_rate: ui.get_export_frame_rate().clamp(24, 60) as u32,
+                video_codec: match ui.get_export_codec().as_str() {
+                    "H.265" => render::ExportVideoCodec::H265,
+                    _ => render::ExportVideoCodec::H264,
+                },
+                bitrate_kbps: match ui.get_export_bitrate().as_str() {
+                    "8 Mbps" => Some(8_000),
+                    "16 Mbps" => Some(16_000),
+                    "32 Mbps" => Some(32_000),
+                    _ => None,
+                },
+            };
             ui.set_export_progress(0.0);
             ui.set_export_in_progress(true);
             ui.set_status_message("Rendering timeline to MP4…".into());
@@ -1867,12 +2036,13 @@ fn configure_editor(
             drop(ui);
             thread::spawn(move || {
                 let progress_weak = weak.clone();
-                let result = render::render_mp4_with_options(
+                let result = render::render_mp4_with_export_options(
                     &clips,
                     &output_path,
                     export_width,
                     export_height,
                     &export_quality,
+                    export_options,
                     move |progress| {
                         let weak = progress_weak.clone();
                         let _ = slint::invoke_from_event_loop(move || {
@@ -2750,9 +2920,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut wgpu_settings = wgpu_30::WGPUSettings::default();
     wgpu_settings.backends = mpv_engine::WGPU_BACKEND;
     wgpu_settings.device_required_features |= mpv_engine::REQUIRED_WGPU_FEATURES;
-    slint::BackendSelector::new()
-        .require_wgpu_30(wgpu_30::WGPUConfiguration::Automatic(wgpu_settings))
-        .select()?;
+    let backend = slint::BackendSelector::new()
+        .require_wgpu_30(wgpu_30::WGPUConfiguration::Automatic(wgpu_settings));
+
+    // Keep AppKit's native traffic lights while letting the custom Slint title
+    // bar render underneath the transparent macOS titlebar.
+    #[cfg(target_os = "macos")]
+    let backend = backend.with_winit_window_attributes_hook(|attributes| {
+        use slint::winit_030::winit::platform::macos::WindowAttributesExtMacOS;
+
+        attributes
+            .with_fullsize_content_view(true)
+            .with_titlebar_transparent(true)
+            .with_title_hidden(true)
+    });
+
+    backend.select()?;
 
     let welcome = WelcomeWindow::new()?;
     welcome.set_is_macos(cfg!(target_os = "macos"));
@@ -2882,6 +3065,7 @@ mod tests {
         let clips = [
             ProjectClipData {
                 name: "sample.mp4".to_owned(),
+                title_text: "Opening title".to_owned(),
                 source_path: media_path.to_string_lossy().into_owned(),
                 duration_seconds: 12.5,
                 start_seconds: 3.0,
@@ -2897,9 +3081,14 @@ mod tests {
                 sharpen: 0.0,
                 transition_in_seconds: 0.25,
                 transition_out_seconds: 0.75,
+                scale: 1.25,
+                rotation: 12.0,
+                animate_scale: true,
+                scale_end: 1.75,
             },
             ProjectClipData {
                 name: "second.mov".to_owned(),
+                title_text: String::new(),
                 source_path: second_media_path.to_string_lossy().into_owned(),
                 duration_seconds: 5.0,
                 start_seconds: 15.5,
@@ -2915,6 +3104,10 @@ mod tests {
                 sharpen: 0.0,
                 transition_in_seconds: 0.0,
                 transition_out_seconds: 0.0,
+                scale: 1.0,
+                rotation: 0.0,
+                animate_scale: false,
+                scale_end: 1.0,
             },
         ];
         let tracks = [
@@ -2941,11 +3134,11 @@ mod tests {
             .expect("manifest exists")
             .read_to_string(&mut manifest)
             .expect("read manifest");
-        assert!(manifest.starts_with("VIDEOPRO_BUNDLE\t4\nNAME\t"));
+        assert!(manifest.starts_with("VIDEOPRO_BUNDLE\t7\nNAME\t"));
         assert!(manifest.contains("TRACK\t1\t-4.500000\t1\t0\n"));
         assert!(manifest.contains("TRACK\t2\t3.000000\t0\t1\n"));
-        assert!(manifest.contains("\t12.500000\t3.000000\t0.500000\t13.000000\t1\t12.000000\t1.100000\t0.900000\t0.800000\t0.250000\t0.750000\t-3.000000\t2.000000\t0.000000\n"));
-        assert!(manifest.contains("\t5.000000\t15.500000\t0.000000\t5.000000\t0\t0.000000\t1.000000\t1.000000\t1.000000\t0.000000\t0.000000\t0.000000\t0.000000\t0.000000\n"));
+        assert!(manifest.contains("\t12.500000\t3.000000\t0.500000\t13.000000\t1\t12.000000\t1.100000\t0.900000\t0.800000\t0.250000\t0.750000\t-3.000000\t2.000000\t0.000000\t4f70656e696e67207469746c65\t1.250000\t12.000000\t1\t1.750000\n"));
+        assert!(manifest.contains("\t5.000000\t15.500000\t0.000000\t5.000000\t0\t0.000000\t1.000000\t1.000000\t1.000000\t0.000000\t0.000000\t0.000000\t0.000000\t0.000000\t\t1.000000\t0.000000\t0\t1.000000\n"));
         assert_eq!(manifest.matches("\nCLIP\t").count(), 2);
 
         let mut media = Vec::new();
@@ -2970,6 +3163,8 @@ mod tests {
             load_project_bundle_into(&bundle_path, &extraction_root).expect("load bundle");
         assert_eq!(loaded_name, "Test Project");
         assert_eq!(loaded_clips.len(), 2);
+        assert_eq!(loaded_clips[0].title_text, "Opening title");
+        assert_eq!(loaded_clips[1].title_text, "");
         assert_eq!(loaded_clips[0].audio_gain_db, -3.0);
         assert_eq!(loaded_clips[0].blur, 2.0);
         assert_eq!(loaded_tracks[1].gain_db, -4.5);

@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 rfd = "0.17.2"
-slint = { version = "~1.18.1", features = ["unstable-wgpu-30", "renderer-femtovg-wgpu"] }
+slint = { version = "~1.18.1", features = ["unstable-wgpu-30", "unstable-winit-030", "renderer-femtovg-wgpu"] }
 mpv-engine = { version = "0.2.1", features = ["wgpu"] }
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
 
