@@ -17,6 +17,7 @@ global Theme {
 }
 
 struct Clip {
+    id: string,
     name: string,
     title-text: string,
     path: string,
@@ -39,6 +40,21 @@ struct Clip {
     rotation: float,
     animate-scale: bool,
     scale-end: float,
+    thumbnail-a: image,
+    thumbnail-b: image,
+    thumbnail-c: image,
+    waveform: image,
+    color: color,
+}
+
+struct MediaAsset {
+    id: string,
+    name: string,
+    path: string,
+    bin: string,
+    duration: string,
+    duration-seconds: float,
+    track: int,
     thumbnail-a: image,
     thumbnail-b: image,
     thumbnail-c: image,
@@ -428,11 +444,17 @@ export component EditorWindow inherits Window {
     in-out property <string> video-duration-time: "--:--";
     in-out property <float> timeline-duration: 10;
     in-out property <[Clip]> clips: [];
-    in-out property <[Clip]> filtered-media: [];
+    in-out property <[MediaAsset]> media-assets: [];
+    in-out property <[MediaAsset]> filtered-media: [];
     in-out property <string> media-search: "";
+    in-out property <[string]> media-bins: ["All Media", "Unsorted"];
+    in-out property <string> media-bin-filter: "All Media";
+    in-out property <string> new-media-bin: "";
     in-out property <[WorkspaceLayout]> custom-layouts: [];
     in-out property <string> layout-name: "My Layout";
     in-out property <string> selected-clip: "";
+    in-out property <string> selected-clip-id: "";
+    in-out property <string> selected-media: "";
     in-out property <float> edit-trim-in: 0;
     in-out property <float> edit-trim-out: 0;
     in-out property <int> edit-track: 1;
@@ -510,7 +532,10 @@ export component EditorWindow inherits Window {
     callback open-project();
     callback import-media();
     callback relink-media();
-    callback filter-media(string);
+    callback filter-media(string, string);
+    callback add-media-to-timeline(string);
+    callback create-media-bin(string);
+    callback move-media-to-bin(string, string);
     callback toggle-playback();
     callback export-project();
     callback save-layout(string);
@@ -530,8 +555,9 @@ export component EditorWindow inherits Window {
     callback undo-edit();
     callback redo-edit();
 
-    changed media-search => { root.filter-media(root.media-search); }
-    changed clips => { root.filter-media(root.media-search); }
+    changed media-search => { root.filter-media(root.media-search, root.media-bin-filter); }
+    changed media-assets => { root.filter-media(root.media-search, root.media-bin-filter); }
+    changed media-bin-filter => { root.filter-media(root.media-search, root.media-bin-filter); }
 
     callback close-window();
     callback minimize-window();
@@ -1106,7 +1132,7 @@ export component EditorWindow inherits Window {
 
                         PanelHeader {
                             title: root.active-mode == "Media" ? "MEDIA LIBRARY" : "PROJECT";
-                            detail: "" + root.clips.length + " items";
+                            detail: "" + root.media-assets.length + " assets";
                         }
 
                         Rectangle {
@@ -1123,6 +1149,43 @@ export component EditorWindow inherits Window {
                         }
 
                         Rectangle {
+                            height: 32px;
+                            background: Theme.panel;
+                            ScrollView {
+                                horizontal-scrollbar-policy: ScrollBarPolicy.as-needed;
+                                HorizontalLayout {
+                                    spacing: 3px;
+                                    for bin in root.media-bins: FlatButton {
+                                        label: bin;
+                                        compact: true;
+                                        primary: root.media-bin-filter == bin;
+                                        clicked => { root.media-bin-filter = bin; }
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            height: 38px;
+                            background: Theme.panel;
+                            HorizontalLayout {
+                                padding-left: 9px;
+                                padding-right: 9px;
+                                spacing: 5px;
+                                LineEdit {
+                                    text <=> root.new-media-bin;
+                                    placeholder-text: "New bin name";
+                                }
+                                FlatButton {
+                                    label: "Create";
+                                    compact: true;
+                                    enabled: root.new-media-bin != "";
+                                    clicked => { root.create-media-bin(root.new-media-bin); }
+                                }
+                            }
+                        }
+
+                        Rectangle {
                             vertical-stretch: 1;
                             background: Theme.bg;
 
@@ -1132,7 +1195,7 @@ export component EditorWindow inherits Window {
 
                                     for clip in root.filtered-media: Rectangle {
                                         height: 58px;
-                                        background: root.selected-clip == clip.path ? #263b54 : Theme.bg;
+                                        background: root.selected-media == clip.path ? #263b54 : Theme.bg;
 
                                         HorizontalLayout {
                                             padding: 9px;
@@ -1168,19 +1231,23 @@ export component EditorWindow inherits Window {
                                                     color: Theme.muted;
                                                     font-size: 13px;
                                                 }
+                                                Text {
+                                                    text: clip.bin;
+                                                    color: Theme.muted;
+                                                    font-size: 11px;
+                                                }
                                             }
                                         }
 
                                         TouchArea {
                                             clicked => {
-                                                root.selected-clip = clip.path;
-                                                root.select-clip(clip.path);
+                                                root.selected-media = clip.path;
                                             }
                                         }
                                     }
 
                                     if root.filtered-media.length == 0: Text {
-                                        text: root.clips.length == 0 ? "No media imported" : "No media matches this search";
+                                        text: root.media-assets.length == 0 ? "No media imported" : "No media matches this search";
                                         color: Theme.muted;
                                         font-size: 13px;
                                     }
@@ -1191,9 +1258,23 @@ export component EditorWindow inherits Window {
                         Divider { }
 
                         FlatButton {
+                            label: "Add selected to timeline";
+                            primary: true;
+                            enabled: root.selected-media != "";
+                            clicked => { root.add-media-to-timeline(root.selected-media); }
+                        }
+
+                        FlatButton {
+                            label: "Move selected to current bin";
+                            quiet: true;
+                            enabled: root.selected-media != "" && root.media-bin-filter != "All Media";
+                            clicked => { root.move-media-to-bin(root.selected-media, root.media-bin-filter); }
+                        }
+
+                        FlatButton {
                             label: "Relink selected media…";
                             quiet: true;
-                            enabled: root.selected-clip != "";
+                            enabled: root.selected-media != "";
                             clicked => { root.relink-media(); }
                         }
 
@@ -2193,7 +2274,7 @@ export component EditorWindow inherits Window {
                                                 y: 6px;
                                                 width: max(clip.duration-seconds / max(root.timeline-duration, 0.001) * lane.width, 24px);
                                                 height: 32px;
-                                                background: root.selected-clip == clip.path ? Theme.blue : clip.color;
+                                                background: root.selected-clip-id == clip.id ? Theme.blue : clip.color;
                                                 border-radius: 4px;
                                                 clip: true;
 
@@ -2238,7 +2319,8 @@ export component EditorWindow inherits Window {
                                                         if (e.button == PointerEventButton.left) {
                                                             if (e.kind == PointerEventKind.down) {
                                                                 root.selected-clip = clip.path;
-                                                                root.select-clip(clip.path);
+                                                                root.selected-clip-id = clip.id;
+                                                                root.select-clip(clip.id);
                                                                 keyboard-shortcuts.focus();
                                                                 parent.press-x = self.mouse-x / 1px;
                                                                 parent.press-y = self.mouse-y / 1px;
@@ -2249,7 +2331,7 @@ export component EditorWindow inherits Window {
                                                                 root.begin-move-clip();
                                                             } else if (e.kind == PointerEventKind.up) {
                                                                 if (parent.moved-once) {
-                                                                    root.move-clip(clip.path, root.dragged-start-seconds, root.drag-target-track);
+                                                                    root.move-clip(clip.id, root.dragged-start-seconds, root.drag-target-track);
                                                                 } else {
                                                                     root.seek-to(clip.start-seconds + clip.duration-seconds
                                                                         * self.mouse-x / max(self.width, 1px));

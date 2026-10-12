@@ -31,6 +31,14 @@ static PENDING_PROJECT_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mute
 const MAX_WORKSPACE_LAYOUTS: usize = 50;
 const MAX_RECENT_PROJECTS: usize = 8;
 static NEXT_PREVIEW_FRAME_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_TIMELINE_CLIP_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_timeline_clip_id() -> String {
+    format!(
+        "clip-{}",
+        NEXT_TIMELINE_CLIP_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 struct ImportedClip {
     name: String,
@@ -276,6 +284,14 @@ struct ProjectClipData {
     scale_end: f32,
 }
 
+#[derive(Clone)]
+struct ProjectMediaData {
+    name: String,
+    source_path: String,
+    duration_seconds: f32,
+    bin: String,
+}
+
 fn apply_clip_preview_settings(
     player: &VideoPlayer,
     clip: &Clip,
@@ -422,8 +438,18 @@ fn save_project_bundle(
     path: &Path,
     project_name: &str,
     clips: &[ProjectClipData],
+    assets: &[ProjectMediaData],
+    bins: &[String],
     tracks: &[AudioTrackSettings; 4],
 ) -> std::io::Result<()> {
+    for asset in assets {
+        if !Path::new(&asset.source_path).is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Media asset is missing: {}", asset.source_path),
+            ));
+        }
+    }
     for clip in clips {
         if !Path::new(&clip.source_path).is_file() {
             return Err(std::io::Error::new(
@@ -446,13 +472,34 @@ fn save_project_bundle(
     let file = fs::File::create(&temporary)?;
     let mut archive = ZipWriter::new(file);
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-    let mut manifest = format!("VIDEOPRO_BUNDLE\t7\nNAME\t{}\n", encode_name(project_name));
+    let mut manifest = format!("VIDEOPRO_BUNDLE\t8\nNAME\t{}\n", encode_name(project_name));
     for (index, track) in tracks.iter().enumerate() {
         manifest.push_str(&format!(
             "TRACK\t{index}\t{:.6}\t{}\t{}\n",
             track.gain_db,
             u8::from(track.muted),
             u8::from(track.solo)
+        ));
+    }
+    for bin in bins {
+        if bin != "All Media" && bin != "Unsorted" {
+            manifest.push_str(&format!("BIN\t{}\n", encode_name(bin)));
+        }
+    }
+
+    for (index, asset) in assets.iter().enumerate() {
+        let source = Path::new(&asset.source_path);
+        let archive_path = format!("media/asset-{index:06}{}", safe_extension(source));
+        archive.start_file(&archive_path, stored)?;
+        let mut input = fs::File::open(source)?;
+        std::io::copy(&mut input, &mut archive)?;
+        manifest.push_str(&format!(
+            "ASSET\t{}\t{}\t{}\t{:.6}\t{}\n",
+            encode_name(&asset.name),
+            encode_name(&asset.source_path),
+            encode_name(&archive_path),
+            asset.duration_seconds,
+            encode_name(&asset.bin),
         ));
     }
 
@@ -528,7 +575,16 @@ fn resolve_project_source(path: &Path) -> Result<PathBuf, String> {
 
 fn load_project_bundle(
     path: &Path,
-) -> Result<(String, Vec<ProjectClipData>, [AudioTrackSettings; 4]), String> {
+) -> Result<
+    (
+        String,
+        Vec<ProjectClipData>,
+        Vec<ProjectMediaData>,
+        Vec<String>,
+        [AudioTrackSettings; 4],
+    ),
+    String,
+> {
     let storage_root = project_storage_dir()
         .ok_or_else(|| "Could not determine VideoPro's project storage directory".to_owned())?
         .join("Projects");
@@ -538,7 +594,16 @@ fn load_project_bundle(
 fn load_project_bundle_into(
     path: &Path,
     storage_root: &Path,
-) -> Result<(String, Vec<ProjectClipData>, [AudioTrackSettings; 4]), String> {
+) -> Result<
+    (
+        String,
+        Vec<ProjectClipData>,
+        Vec<ProjectMediaData>,
+        Vec<String>,
+        [AudioTrackSettings; 4],
+    ),
+    String,
+> {
     let source_path = resolve_project_source(path)?;
     let file = fs::File::open(&source_path).map_err(|error| error.to_string())?;
     let mut archive = ZipArchive::new(file)
@@ -547,7 +612,7 @@ fn load_project_bundle_into(
     const MAX_MEDIA_ENTRY_BYTES: u64 = 10 * 1024 * 1024 * 1024;
     const MAX_TOTAL_MEDIA_BYTES: u64 = 20 * 1024 * 1024 * 1024;
     const MAX_CLIPS: usize = 10_000;
-    if archive.len() > MAX_CLIPS + 1024 {
+    if archive.len() > MAX_CLIPS * 2 + 1024 {
         return Err("Project bundle contains too many ZIP entries".to_owned());
     }
     let mut manifest = String::new();
@@ -576,6 +641,7 @@ fn load_project_bundle_into(
         Some("VIDEOPRO_BUNDLE\t5") => 5,
         Some("VIDEOPRO_BUNDLE\t6") => 6,
         Some("VIDEOPRO_BUNDLE\t7") => 7,
+        Some("VIDEOPRO_BUNDLE\t8") => 8,
         _ => return Err("Unsupported VideoPro project version".to_owned()),
     };
     let project_name = lines
@@ -633,8 +699,116 @@ fn load_project_bundle_into(
     fs::create_dir_all(&extraction_root).map_err(|error| error.to_string())?;
 
     let mut clips = Vec::new();
+    let mut assets = Vec::new();
+    let mut media_bins = vec!["All Media".to_owned(), "Unsorted".to_owned()];
+    let mut asset_path_by_original = HashMap::<String, PathBuf>::new();
     let mut total_media_bytes = 0_u64;
     let load_result = (|| -> Result<(), String> {
+        if version >= 8 {
+            for line in &remaining_lines {
+                let Some(encoded) = line.strip_prefix("BIN\t") else {
+                    continue;
+                };
+                let bin =
+                    decode_name(encoded).ok_or_else(|| "Invalid media bin name".to_owned())?;
+                if bin.trim().is_empty() || bin == "All Media" || bin == "Unsorted" {
+                    return Err("Invalid reserved media bin name".to_owned());
+                }
+                if !media_bins.contains(&bin) {
+                    if media_bins.len() >= 256 {
+                        return Err("Project exceeds the 256 media-bin limit".to_owned());
+                    }
+                    media_bins.push(bin);
+                }
+            }
+            for (index, line) in remaining_lines.iter().enumerate() {
+                let fields: Vec<&str> = line.split('\t').collect();
+                if fields.first() != Some(&"ASSET") {
+                    continue;
+                }
+                if fields.len() != 6 || assets.len() >= MAX_CLIPS {
+                    return Err("Malformed or excessive media asset entries".to_owned());
+                }
+                let name =
+                    decode_name(fields[1]).ok_or_else(|| "Invalid media asset name".to_owned())?;
+                let original_path = decode_name(fields[2])
+                    .ok_or_else(|| "Invalid media asset source path".to_owned())?;
+                let archive_path = decode_name(fields[3])
+                    .ok_or_else(|| "Invalid media asset archive path".to_owned())?;
+                let duration_seconds = fields[4]
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|duration| duration.is_finite() && *duration > 0.0)
+                    .ok_or_else(|| "Invalid media asset duration".to_owned())?;
+                let bin =
+                    decode_name(fields[5]).ok_or_else(|| "Invalid media asset bin".to_owned())?;
+                if !archive_path.starts_with("media/")
+                    || archive_path.split('/').any(|part| part == "..")
+                {
+                    return Err("Unsafe media asset path in project manifest".to_owned());
+                }
+                let extension = safe_extension(Path::new(&archive_path));
+                let extracted_path = extraction_root.join(format!("asset-{index:06}{extension}"));
+                let mut output =
+                    fs::File::create(&extracted_path).map_err(|error| error.to_string())?;
+                match archive.by_name(&archive_path) {
+                    Ok(mut input) => {
+                        let size = input.size();
+                        if size > MAX_MEDIA_ENTRY_BYTES {
+                            return Err(format!(
+                                "Embedded media asset exceeds the 10 GiB limit: {name}"
+                            ));
+                        }
+                        total_media_bytes = total_media_bytes
+                            .checked_add(size)
+                            .filter(|total| *total <= MAX_TOTAL_MEDIA_BYTES)
+                            .ok_or_else(|| {
+                                "Project exceeds the 20 GiB total media limit".to_owned()
+                            })?;
+                        let copied = std::io::copy(&mut input, &mut output)
+                            .map_err(|error| error.to_string())?;
+                        if copied != size {
+                            return Err(format!("Embedded media asset was truncated: {name}"));
+                        }
+                    }
+                    Err(_) if Path::new(&original_path).is_file() => {
+                        let source = Path::new(&original_path);
+                        let size = fs::metadata(source)
+                            .map_err(|error| error.to_string())?
+                            .len();
+                        if size > MAX_MEDIA_ENTRY_BYTES {
+                            return Err(format!(
+                                "Relinked media asset exceeds the 10 GiB limit: {name}"
+                            ));
+                        }
+                        total_media_bytes = total_media_bytes
+                            .checked_add(size)
+                            .filter(|total| *total <= MAX_TOTAL_MEDIA_BYTES)
+                            .ok_or_else(|| {
+                                "Project exceeds the 20 GiB total media limit".to_owned()
+                            })?;
+                        let mut input =
+                            fs::File::open(source).map_err(|error| error.to_string())?;
+                        std::io::copy(&mut input, &mut output)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Err(_) => return Err(format!("Project is missing media asset '{name}'")),
+                }
+                assets.push(ProjectMediaData {
+                    name,
+                    source_path: extracted_path.to_string_lossy().into_owned(),
+                    duration_seconds,
+                    bin,
+                });
+                asset_path_by_original.insert(
+                    media_path_identity(Path::new(&original_path)),
+                    extracted_path,
+                );
+                if !media_bins.contains(&assets.last().expect("asset was just inserted").bin) {
+                    media_bins.push(assets.last().expect("asset was just inserted").bin.clone());
+                }
+            }
+        }
         for (index, line) in remaining_lines.iter().enumerate() {
             let fields: Vec<&str> = line.split('\t').collect();
             if fields.first() != Some(&"CLIP") {
@@ -758,61 +932,71 @@ fn load_project_bundle_into(
                 return Err("Invalid clip timing in project manifest".to_owned());
             }
 
+            let shared_asset_path = asset_path_by_original
+                .get(&media_path_identity(Path::new(&original_path)))
+                .cloned();
             let extension = safe_extension(Path::new(&archive_path));
-            let extracted_path = extraction_root.join(format!("{index:06}{extension}"));
-            let mut output =
-                fs::File::create(&extracted_path).map_err(|error| error.to_string())?;
-            match archive.by_name(&archive_path) {
-                Ok(mut input) => {
-                    if input.size() > MAX_MEDIA_ENTRY_BYTES {
+            let extracted_path = shared_asset_path
+                .clone()
+                .unwrap_or_else(|| extraction_root.join(format!("{index:06}{extension}")));
+            if shared_asset_path.is_none() {
+                let mut output =
+                    fs::File::create(&extracted_path).map_err(|error| error.to_string())?;
+                match archive.by_name(&archive_path) {
+                    Ok(mut input) => {
+                        if input.size() > MAX_MEDIA_ENTRY_BYTES {
+                            return Err(format!(
+                                "Embedded media exceeds the 10 GiB safety limit: {name}"
+                            ));
+                        }
+                        total_media_bytes = total_media_bytes
+                            .checked_add(input.size())
+                            .filter(|size| *size <= MAX_TOTAL_MEDIA_BYTES)
+                            .ok_or_else(|| {
+                                "Project exceeds the 20 GiB total embedded media limit".to_owned()
+                            })?;
+                        let expected_size = input.size();
+                        let copied = std::io::copy(&mut input, &mut output)
+                            .map_err(|error| error.to_string())?;
+                        if copied != expected_size {
+                            return Err(format!("Embedded media was truncated: {name}"));
+                        }
+                    }
+                    Err(_)
+                        if Path::new(&original_path).is_file()
+                            && Path::new(&original_path).file_name()
+                                == Path::new(&name).file_name()
+                            && safe_extension(Path::new(&original_path))
+                                == safe_extension(Path::new(&archive_path)) =>
+                    {
+                        // If an archive entry was lost during an interrupted/corrupt
+                        // copy, recover from the original source when it still exists.
+                        let source = Path::new(&original_path);
+                        let size = fs::metadata(source)
+                            .map_err(|error| error.to_string())?
+                            .len();
+                        if size > MAX_MEDIA_ENTRY_BYTES {
+                            return Err(format!("Relinked media exceeds the 10 GiB limit: {name}"));
+                        }
+                        total_media_bytes = total_media_bytes
+                            .checked_add(size)
+                            .filter(|size| *size <= MAX_TOTAL_MEDIA_BYTES)
+                            .ok_or_else(|| {
+                                "Project exceeds the 20 GiB total media limit".to_owned()
+                            })?;
+                        let mut input =
+                            fs::File::open(source).map_err(|error| error.to_string())?;
+                        let copied = std::io::copy(&mut input, &mut output)
+                            .map_err(|error| error.to_string())?;
+                        if copied != size {
+                            return Err(format!("Relinked media changed while copying: {name}"));
+                        }
+                    }
+                    Err(_) => {
                         return Err(format!(
-                            "Embedded media exceeds the 10 GiB safety limit: {name}"
+                            "Project is missing embedded media '{name}', and its original file is unavailable"
                         ));
                     }
-                    total_media_bytes = total_media_bytes
-                        .checked_add(input.size())
-                        .filter(|size| *size <= MAX_TOTAL_MEDIA_BYTES)
-                        .ok_or_else(|| {
-                            "Project exceeds the 20 GiB total embedded media limit".to_owned()
-                        })?;
-                    let expected_size = input.size();
-                    let copied = std::io::copy(&mut input, &mut output)
-                        .map_err(|error| error.to_string())?;
-                    if copied != expected_size {
-                        return Err(format!("Embedded media was truncated: {name}"));
-                    }
-                }
-                Err(_)
-                    if Path::new(&original_path).is_file()
-                        && Path::new(&original_path).file_name()
-                            == Path::new(&name).file_name()
-                        && safe_extension(Path::new(&original_path))
-                            == safe_extension(Path::new(&archive_path)) =>
-                {
-                    // If an archive entry was lost during an interrupted/corrupt
-                    // copy, recover from the original source when it still exists.
-                    let source = Path::new(&original_path);
-                    let size = fs::metadata(source)
-                        .map_err(|error| error.to_string())?
-                        .len();
-                    if size > MAX_MEDIA_ENTRY_BYTES {
-                        return Err(format!("Relinked media exceeds the 10 GiB limit: {name}"));
-                    }
-                    total_media_bytes = total_media_bytes
-                        .checked_add(size)
-                        .filter(|size| *size <= MAX_TOTAL_MEDIA_BYTES)
-                        .ok_or_else(|| "Project exceeds the 20 GiB total media limit".to_owned())?;
-                    let mut input = fs::File::open(source).map_err(|error| error.to_string())?;
-                    let copied = std::io::copy(&mut input, &mut output)
-                        .map_err(|error| error.to_string())?;
-                    if copied != size {
-                        return Err(format!("Relinked media changed while copying: {name}"));
-                    }
-                }
-                Err(_) => {
-                    return Err(format!(
-                        "Project is missing embedded media '{name}', and its original file is unavailable"
-                    ));
                 }
             }
             clips.push(ProjectClipData {
@@ -854,7 +1038,30 @@ fn load_project_bundle_into(
             clip.source_path = final_root.join(relative).to_string_lossy().into_owned();
         }
     }
-    Ok((project_name, clips, track_settings))
+    for asset in &mut assets {
+        if let Ok(relative) = Path::new(&asset.source_path).strip_prefix(&extraction_root) {
+            asset.source_path = final_root.join(relative).to_string_lossy().into_owned();
+        }
+    }
+    if assets.is_empty() {
+        let mut seen = HashSet::new();
+        for clip in &clips {
+            if seen.insert(media_path_identity(Path::new(&clip.source_path))) {
+                assets.push(ProjectMediaData {
+                    name: clip.name.clone(),
+                    source_path: clip.source_path.clone(),
+                    duration_seconds: clip.source_out_seconds.max(0.05),
+                    bin: "Unsorted".to_owned(),
+                });
+            }
+        }
+    }
+    for asset in &assets {
+        if !media_bins.contains(&asset.bin) {
+            media_bins.push(asset.bin.clone());
+        }
+    }
+    Ok((project_name, clips, assets, media_bins, track_settings))
 }
 
 fn load_workspace_layouts() -> Vec<WorkspaceLayout> {
@@ -1001,6 +1208,40 @@ fn save_workspace_layouts(layouts: &[WorkspaceLayout]) -> std::io::Result<()> {
 
 slint::include_modules!();
 
+fn timeline_clip_from_asset(asset: &MediaAsset, start_seconds: f32) -> Clip {
+    let duration_seconds = asset.duration_seconds.max(0.05);
+    Clip {
+        id: next_timeline_clip_id().into(),
+        name: asset.name.clone(),
+        title_text: "".into(),
+        path: asset.path.clone(),
+        duration: format_time(duration_seconds as f64).into(),
+        duration_seconds,
+        start_seconds,
+        source_in_seconds: 0.0,
+        source_out_seconds: duration_seconds,
+        track: asset.track.clamp(0, 3),
+        exposure: 0.0,
+        contrast: 1.0,
+        saturation: 1.0,
+        opacity: 1.0,
+        audio_gain_db: 0.0,
+        blur: 0.0,
+        sharpen: 0.0,
+        transition_in_seconds: 0.0,
+        transition_out_seconds: 0.0,
+        scale: 1.0,
+        rotation: 0.0,
+        animate_scale: false,
+        scale_end: 1.0,
+        thumbnail_a: asset.thumbnail_a.clone(),
+        thumbnail_b: asset.thumbnail_b.clone(),
+        thumbnail_c: asset.thumbnail_c.clone(),
+        waveform: asset.waveform.clone(),
+        color: asset.color,
+    }
+}
+
 fn configure_editor(
     editor: &EditorWindow,
     player: Rc<VideoPlayer>,
@@ -1045,8 +1286,25 @@ fn configure_editor(
                 let _ = player.engine.stop();
                 ui.set_is_playing(false);
                 ui.set_clips(Rc::new(slint::VecModel::from(Vec::<Clip>::new())).into());
+                ui.set_media_assets(
+                    Rc::new(slint::VecModel::from(Vec::<MediaAsset>::new())).into(),
+                );
+                ui.set_filtered_media(
+                    Rc::new(slint::VecModel::from(Vec::<MediaAsset>::new())).into(),
+                );
+                ui.set_media_bins(
+                    Rc::new(slint::VecModel::from(vec![
+                        "All Media".into(),
+                        "Unsorted".into(),
+                    ]))
+                    .into(),
+                );
+                ui.set_media_bin_filter("All Media".into());
+                ui.set_new_media_bin("".into());
                 ui.set_project_name("Untitled Project".into());
                 ui.set_selected_clip("".into());
+                ui.set_selected_clip_id("".into());
+                ui.set_selected_media("".into());
                 ui.set_video_frame(Image::default());
                 ui.set_has_video_frame(false);
                 ui.set_playhead_seconds(0.0);
@@ -1106,12 +1364,28 @@ fn configure_editor(
                     scale_end: clip.scale_end,
                 })
                 .collect();
-            ui.set_status_message(format!("Packaging {} media file(s)…", clips.len()).into());
+            let assets: Vec<ProjectMediaData> = ui
+                .get_media_assets()
+                .iter()
+                .map(|asset| ProjectMediaData {
+                    name: asset.name.to_string(),
+                    source_path: asset.path.to_string(),
+                    duration_seconds: asset.duration_seconds,
+                    bin: asset.bin.to_string(),
+                })
+                .collect();
+            let bins: Vec<String> = ui
+                .get_media_bins()
+                .iter()
+                .map(|bin| bin.to_string())
+                .collect();
+            ui.set_status_message(format!("Packaging {} media asset(s)…", assets.len()).into());
             drop(ui);
 
             let weak = weak.clone();
             thread::spawn(move || {
-                let result = save_project_bundle(&path, &project_name, &clips, &tracks);
+                let result =
+                    save_project_bundle(&path, &project_name, &clips, &assets, &bins, &tracks);
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = weak.upgrade() {
                         match result {
@@ -1170,7 +1444,7 @@ fn configure_editor(
                 let result = load_project_bundle(&path);
                 let mut load_error = None;
                 let prepared = match result {
-                    Ok((project_name, entries, tracks)) => {
+                    Ok((project_name, entries, assets, bins, tracks)) => {
                         let mut imported = Vec::with_capacity(entries.len());
                         for (index, clip) in entries.into_iter().enumerate() {
                             let media_path = PathBuf::from(&clip.source_path);
@@ -1216,7 +1490,23 @@ fn configure_editor(
                                 waveform,
                             ));
                         }
-                        Some((project_name, imported, tracks))
+                        let mut prepared_assets = Vec::with_capacity(assets.len());
+                        for (index, asset) in assets.into_iter().enumerate() {
+                            let media_path = PathBuf::from(&asset.source_path);
+                            let duration = probe_duration(&media_path)
+                                .unwrap_or(asset.duration_seconds as f64)
+                                as f32;
+                            let thumbnails = [
+                                make_thumbnail(&media_path, duration as f64 * 0.05, index * 3),
+                                make_thumbnail(&media_path, duration as f64 * 0.5, index * 3 + 1),
+                                make_thumbnail(&media_path, duration as f64 * 0.9, index * 3 + 2),
+                            ];
+                            let waveform = render::has_audio(&media_path)
+                                .then(|| make_waveform(&media_path))
+                                .flatten();
+                            prepared_assets.push((asset, duration, thumbnails, waveform));
+                        }
+                        Some((project_name, imported, prepared_assets, bins, tracks))
                     }
                     Err(error) => {
                         load_error = Some(error);
@@ -1234,7 +1524,9 @@ fn configure_editor(
                         ui.set_status_message(format!("Could not open project: {error}").into());
                         return;
                     }
-                    let Some((project_name, imported, tracks)) = prepared else {
+                    let Some((project_name, imported, prepared_assets, saved_bins, tracks)) =
+                        prepared
+                    else {
                         return;
                     };
                     let mut clips = Vec::with_capacity(imported.len());
@@ -1252,6 +1544,7 @@ fn configure_editor(
                     {
                         end = end.max(saved.start_seconds + duration_seconds);
                         clips.push(Clip {
+                            id: next_timeline_clip_id().into(),
                             name: saved.name.into(),
                             title_text: saved.title_text.into(),
                             path: path.into(),
@@ -1296,8 +1589,68 @@ fn configure_editor(
                     ui.set_project_name(project_name.into());
                     set_audio_track_settings(&ui, tracks);
                     reset_for_load.store(true, Ordering::Release);
+                    let media_assets: Vec<MediaAsset> = prepared_assets
+                        .into_iter()
+                        .map(|(asset, duration, thumbnails, waveform)| {
+                            let track = if render::has_video(Path::new(&asset.source_path)) {
+                                1
+                            } else {
+                                2
+                            };
+                            MediaAsset {
+                                id: format!("asset-{}", encode_name(&asset.source_path)).into(),
+                                name: asset.name.into(),
+                                path: asset.source_path.into(),
+                                bin: asset.bin.into(),
+                                duration: format_time(duration as f64).into(),
+                                duration_seconds: duration,
+                                track,
+                                thumbnail_a: thumbnails[0]
+                                    .as_ref()
+                                    .and_then(|p| Image::load_from_path(p).ok())
+                                    .unwrap_or_default(),
+                                thumbnail_b: thumbnails[1]
+                                    .as_ref()
+                                    .and_then(|p| Image::load_from_path(p).ok())
+                                    .unwrap_or_default(),
+                                thumbnail_c: thumbnails[2]
+                                    .as_ref()
+                                    .and_then(|p| Image::load_from_path(p).ok())
+                                    .unwrap_or_default(),
+                                waveform: waveform
+                                    .as_ref()
+                                    .and_then(|p| Image::load_from_path(p).ok())
+                                    .unwrap_or_default(),
+                                color: slint::Color::from_rgb_u8(55, 91, 135),
+                            }
+                        })
+                        .collect();
+                    ui.set_media_assets(Rc::new(slint::VecModel::from(media_assets)).into());
+                    let mut bins = saved_bins;
+                    if !bins.iter().any(|bin| bin == "All Media") {
+                        bins.insert(0, "All Media".to_owned());
+                    }
+                    if !bins.iter().any(|bin| bin == "Unsorted") {
+                        bins.insert(1.min(bins.len()), "Unsorted".to_owned());
+                    }
+                    for asset in ui.get_media_assets().iter() {
+                        let bin = asset.bin.to_string();
+                        if !bins.contains(&bin) {
+                            bins.push(bin);
+                        }
+                    }
+                    ui.set_media_bins(
+                        Rc::new(slint::VecModel::from(
+                            bins.into_iter().map(Into::into).collect::<Vec<_>>(),
+                        ))
+                        .into(),
+                    );
+                    ui.set_media_bin_filter("All Media".into());
+                    ui.set_new_media_bin("".into());
                     ui.set_clips(Rc::new(slint::VecModel::from(clips)).into());
                     ui.set_selected_clip("".into());
+                    ui.set_selected_clip_id("".into());
+                    ui.set_selected_media("".into());
                     ui.set_video_frame(Image::default());
                     ui.set_has_video_frame(false);
                     ui.set_playhead_seconds(0.0);
@@ -1314,8 +1667,6 @@ fn configure_editor(
 
     editor.on_import_media({
         let weak = editor.as_weak();
-        let undo = Rc::clone(&undo_stack);
-        let redo = Rc::clone(&redo_stack);
         let generation = Arc::clone(&project_generation);
 
         move || {
@@ -1326,7 +1677,7 @@ fn configure_editor(
                 return;
             };
             let mut seen_paths: HashSet<String> = ui
-                .get_clips()
+                .get_media_assets()
                 .iter()
                 .map(|clip| media_path_identity(Path::new(clip.path.as_str())))
                 .collect();
@@ -1338,16 +1689,10 @@ fn configure_editor(
                 ui.set_status_message("All selected files are already in the media library".into());
                 return;
             }
-            let base_index = ui.get_clips().row_count();
+            let base_index = ui.get_media_assets().row_count();
+            let import_bin = ui.get_media_bin_filter().to_string();
             let import_generation = generation.load(Ordering::Acquire);
             ui.set_status_message(format!("Analyzing {} file(s)…", files.len()).into());
-            if !files.is_empty() {
-                undo.borrow_mut().push(ui.get_clips().iter().collect());
-                if undo.borrow().len() > 100 {
-                    undo.borrow_mut().remove(0);
-                }
-                redo.borrow_mut().clear();
-            }
             drop(ui);
 
             let weak = weak.clone();
@@ -1402,40 +1747,22 @@ fn configure_editor(
                         return;
                     }
                     let imported_count = imported.len();
-                    let mut clips: Vec<Clip> = ui.get_clips().iter().collect();
-                    let mut next_start_by_track = [0.0_f32; 4];
-                    for clip in &clips {
-                        let track = clip.track.clamp(0, 3) as usize;
-                        next_start_by_track[track] = next_start_by_track[track]
-                            .max(clip.start_seconds + clip.duration_seconds);
-                    }
-                    clips.extend(imported.into_iter().map(|clip| {
-                        let track = clip.track.clamp(0, 3);
-                        let start_seconds = next_start_by_track[track as usize];
-                        next_start_by_track[track as usize] += clip.duration_seconds;
-                        Clip {
+                    let target_bin = if import_bin == "All Media" {
+                        "Unsorted".to_owned()
+                    } else {
+                        import_bin
+                    };
+                    let first_imported_path = imported.first().map(|clip| clip.path.clone());
+                    let mut assets: Vec<MediaAsset> = ui.get_media_assets().iter().collect();
+                    assets.extend(imported.into_iter().map(|clip| {
+                        MediaAsset {
+                            id: format!("asset-{}", encode_name(&clip.path)).into(),
                             name: clip.name.into(),
-                            title_text: "".into(),
                             path: clip.path.into(),
+                            bin: target_bin.clone().into(),
                             duration: clip.duration.into(),
                             duration_seconds: clip.duration_seconds,
-                            start_seconds,
-                            source_in_seconds: 0.0,
-                            source_out_seconds: clip.duration_seconds,
-                            track,
-                            exposure: 0.0,
-                            contrast: 1.0,
-                            saturation: 1.0,
-                            opacity: 1.0,
-                            audio_gain_db: 0.0,
-                            blur: 0.0,
-                            sharpen: 0.0,
-                            transition_in_seconds: 0.0,
-                            transition_out_seconds: 0.0,
-                            scale: 1.0,
-                            rotation: 0.0,
-                            animate_scale: false,
-                            scale_end: 1.0,
+                            track: clip.track,
                             thumbnail_a: clip.thumbnails[0]
                                 .as_ref()
                                 .and_then(|path| Image::load_from_path(path).ok())
@@ -1456,14 +1783,12 @@ fn configure_editor(
                             color: slint::Color::from_rgb_u8(55, 91, 135),
                         }
                     }));
-                    let start = clips
-                        .iter()
-                        .map(|clip| clip.start_seconds + clip.duration_seconds)
-                        .fold(0.0_f32, f32::max);
-                    ui.set_timeline_duration(if start > 0.0 { start } else { 10.0 });
-                    ui.set_clips(Rc::new(slint::VecModel::from(clips)).into());
+                    ui.set_media_assets(Rc::new(slint::VecModel::from(assets)).into());
+                    if let Some(path) = first_imported_path {
+                        ui.set_selected_media(path.into());
+                    }
                     ui.set_status_message(
-                        format!("Added {imported_count} media file(s) to the project").into(),
+                        format!("Imported {imported_count} media asset(s)").into(),
                     );
                 });
             });
@@ -1476,7 +1801,7 @@ fn configure_editor(
             let Some(ui) = weak.upgrade() else {
                 return;
             };
-            let selected_path = ui.get_selected_clip().to_string();
+            let selected_path = ui.get_selected_media().to_string();
             if selected_path.is_empty() {
                 ui.set_status_message("Select a media item to relink first".into());
                 return;
@@ -1502,8 +1827,17 @@ fn configure_editor(
                 .and_then(|name| name.to_str())
                 .unwrap_or("Media")
                 .to_owned();
+            let mut assets: Vec<MediaAsset> = ui.get_media_assets().iter().collect();
             let mut clips: Vec<Clip> = ui.get_clips().iter().collect();
             let mut changed = false;
+            for asset in &mut assets {
+                if asset.path.as_str() == selected_path {
+                    asset.path = replacement_string.clone().into();
+                    asset.name = replacement_name.clone().into();
+                    asset.id = format!("asset-{}", encode_name(&replacement_string)).into();
+                    changed = true;
+                }
+            }
             for clip in &mut clips {
                 if clip.path.as_str() == selected_path {
                     clip.path = replacement_string.clone().into();
@@ -1515,29 +1849,131 @@ fn configure_editor(
                 ui.set_status_message("The selected media item is no longer in the project".into());
                 return;
             }
+            ui.set_media_assets(Rc::new(slint::VecModel::from(assets)).into());
             ui.set_clips(Rc::new(slint::VecModel::from(clips)).into());
-            ui.set_selected_clip(replacement_string.into());
+            ui.set_selected_media(replacement_string.into());
             ui.set_status_message(format!("Relinked media to {replacement_name}").into());
+        }
+    });
+
+    editor.on_add_media_to_timeline({
+        let weak = editor.as_weak();
+        let undo = Rc::clone(&undo_stack);
+        let redo = Rc::clone(&redo_stack);
+        move |path| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let Some(asset) = ui
+                .get_media_assets()
+                .iter()
+                .find(|asset| asset.path == path)
+            else {
+                ui.set_status_message("Select a media asset first".into());
+                return;
+            };
+            let mut clips: Vec<Clip> = ui.get_clips().iter().collect();
+            undo.borrow_mut().push(clips.clone());
+            if undo.borrow().len() > 100 {
+                undo.borrow_mut().remove(0);
+            }
+            redo.borrow_mut().clear();
+            let track = asset.track.clamp(0, 3);
+            let start_seconds = clips
+                .iter()
+                .filter(|clip| clip.track == track)
+                .map(|clip| clip.start_seconds + clip.duration_seconds)
+                .fold(0.0_f32, f32::max);
+            let instance = timeline_clip_from_asset(&asset, start_seconds);
+            let instance_id = instance.id.clone();
+            let instance_path = instance.path.clone();
+            clips.push(instance);
+            let end = clips
+                .iter()
+                .map(|clip| clip.start_seconds + clip.duration_seconds)
+                .fold(10.0_f32, f32::max);
+            ui.set_clips(Rc::new(slint::VecModel::from(clips)).into());
+            ui.set_timeline_duration(end);
+            ui.set_selected_clip(instance_path);
+            ui.set_selected_clip_id(instance_id.clone());
+            ui.invoke_select_clip(instance_id);
+            ui.set_status_message(format!("Added {} to the timeline", asset.name).into());
         }
     });
 
     editor.on_filter_media({
         let weak = editor.as_weak();
-        move |query| {
+        move |query, bin| {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
             let query = query.to_string().trim().to_lowercase();
-            let filtered: Vec<Clip> = ui
-                .get_clips()
+            let bin = bin.to_string();
+            let filtered: Vec<MediaAsset> = ui
+                .get_media_assets()
                 .iter()
                 .filter(|clip| {
-                    query.is_empty()
-                        || clip.name.to_string().to_lowercase().contains(&query)
-                        || clip.path.to_string().to_lowercase().contains(&query)
+                    (bin == "All Media" || clip.bin.as_str() == bin)
+                        && (query.is_empty()
+                            || clip.name.to_string().to_lowercase().contains(&query)
+                            || clip.path.to_string().to_lowercase().contains(&query))
                 })
                 .collect();
             ui.set_filtered_media(Rc::new(slint::VecModel::from(filtered)).into());
+        }
+    });
+
+    editor.on_create_media_bin({
+        let weak = editor.as_weak();
+        move |name| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let name = name.to_string().trim().to_owned();
+            if name.is_empty() || name.eq_ignore_ascii_case("All Media") {
+                ui.set_status_message("Enter a valid bin name".into());
+                return;
+            }
+            let mut bins: Vec<String> = ui
+                .get_media_bins()
+                .iter()
+                .map(|bin| bin.to_string())
+                .collect();
+            if bins.iter().any(|bin| bin.eq_ignore_ascii_case(&name)) {
+                ui.set_status_message("A bin with that name already exists".into());
+                return;
+            }
+            bins.push(name.clone());
+            ui.set_media_bins(
+                Rc::new(slint::VecModel::from(
+                    bins.into_iter().map(Into::into).collect::<Vec<_>>(),
+                ))
+                .into(),
+            );
+            ui.set_media_bin_filter(name.clone().into());
+            ui.set_new_media_bin("".into());
+            ui.set_status_message(format!("Created media bin: {name}").into());
+        }
+    });
+
+    editor.on_move_media_to_bin({
+        let weak = editor.as_weak();
+        move |path, bin| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let bin = bin.to_string();
+            if bin == "All Media" {
+                return;
+            }
+            let mut assets: Vec<MediaAsset> = ui.get_media_assets().iter().collect();
+            let Some(asset) = assets.iter_mut().find(|asset| asset.path == path) else {
+                ui.set_status_message("Select a media asset first".into());
+                return;
+            };
+            asset.bin = bin.clone().into();
+            ui.set_media_assets(Rc::new(slint::VecModel::from(assets)).into());
+            ui.set_status_message(format!("Moved media to {bin}").into());
         }
     });
 
@@ -1548,48 +1984,44 @@ fn configure_editor(
         let pending_local = Rc::clone(&pending_local_seek);
         let file_ready = Rc::clone(&file_ready);
 
-        move |path| {
+        move |clip_id| {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
-
+            let Some(clip) = ui.get_clips().iter().find(|clip| clip.id == clip_id) else {
+                return;
+            };
+            let path = clip.path.clone();
             let preview_path = preview_media_path(path.as_str());
             match player.load(preview_path.as_str()) {
                 Ok(()) => {
                     ui.set_selected_clip(path);
-                    if let Some(clip) = ui
-                        .get_clips()
-                        .iter()
-                        .find(|clip| clip.path == ui.get_selected_clip())
-                    {
-                        ui.set_video_duration(
-                            clip.source_out_seconds.max(clip.source_in_seconds + 0.05),
-                        );
-                        ui.set_video_duration_time(
-                            format_time(clip.source_out_seconds as f64).into(),
-                        );
-                        ui.set_edit_trim_in(clip.source_in_seconds);
-                        ui.set_edit_title_text(clip.title_text.to_string().into());
-                        ui.set_edit_trim_out(clip.source_out_seconds);
-                        ui.set_edit_track(clip.track);
-                        ui.set_edit_exposure(clip.exposure);
-                        ui.set_edit_contrast(clip.contrast);
-                        ui.set_edit_saturation(clip.saturation);
-                        ui.set_edit_opacity(clip.opacity);
-                        ui.set_edit_audio_gain_db(clip.audio_gain_db);
-                        ui.set_edit_blur(clip.blur);
-                        ui.set_edit_sharpen(clip.sharpen);
-                        ui.set_edit_transition_in(clip.transition_in_seconds);
-                        ui.set_edit_transition_out(clip.transition_out_seconds);
-                        ui.set_edit_scale(clip.scale);
-                        ui.set_edit_rotation(clip.rotation);
-                        ui.set_edit_animate_scale(clip.animate_scale);
-                        ui.set_edit_scale_end(clip.scale_end);
-                        apply_clip_preview_settings(&player, &clip, &audio_track_settings(&ui));
-                        file_ready.set(false);
-                        pending_local.set(Some(clip.source_in_seconds as f64));
-                        pending_seek.set(Some(clip.start_seconds));
-                    }
+                    ui.set_selected_clip_id(clip_id);
+                    ui.set_video_duration(
+                        clip.source_out_seconds.max(clip.source_in_seconds + 0.05),
+                    );
+                    ui.set_video_duration_time(format_time(clip.source_out_seconds as f64).into());
+                    ui.set_edit_trim_in(clip.source_in_seconds);
+                    ui.set_edit_title_text(clip.title_text.to_string().into());
+                    ui.set_edit_trim_out(clip.source_out_seconds);
+                    ui.set_edit_track(clip.track);
+                    ui.set_edit_exposure(clip.exposure);
+                    ui.set_edit_contrast(clip.contrast);
+                    ui.set_edit_saturation(clip.saturation);
+                    ui.set_edit_opacity(clip.opacity);
+                    ui.set_edit_audio_gain_db(clip.audio_gain_db);
+                    ui.set_edit_blur(clip.blur);
+                    ui.set_edit_sharpen(clip.sharpen);
+                    ui.set_edit_transition_in(clip.transition_in_seconds);
+                    ui.set_edit_transition_out(clip.transition_out_seconds);
+                    ui.set_edit_scale(clip.scale);
+                    ui.set_edit_rotation(clip.rotation);
+                    ui.set_edit_animate_scale(clip.animate_scale);
+                    ui.set_edit_scale_end(clip.scale_end);
+                    apply_clip_preview_settings(&player, &clip, &audio_track_settings(&ui));
+                    file_ready.set(false);
+                    pending_local.set(Some(clip.source_in_seconds as f64));
+                    pending_seek.set(Some(clip.start_seconds));
                     ui.set_is_playing(true);
                     ui.set_status_message("Loading video".into());
                 }
@@ -1607,13 +2039,14 @@ fn configure_editor(
                 return;
             };
             let selected = ui.get_selected_clip().to_string();
+            let selected_id = ui.get_selected_clip_id().to_string();
             if selected.is_empty() {
                 ui.set_status_message("Select a clip before generating a proxy".into());
                 return;
             }
             ui.set_status_message("Generating preview proxy…".into());
             let weak = weak.clone();
-            let selected_for_reload = selected.clone();
+            let selected_for_reload = selected_id;
             thread::spawn(move || {
                 let result = proxy::create_proxy(&selected);
                 let _ = slint::invoke_from_event_loop(move || {
@@ -1653,12 +2086,12 @@ fn configure_editor(
             let Some(ui) = weak.upgrade() else {
                 return;
             };
-            let selected = ui.get_selected_clip().to_string();
+            let selected = ui.get_selected_clip_id().to_string();
             if selected.is_empty() {
                 return;
             }
             let mut clips: Vec<Clip> = ui.get_clips().iter().collect();
-            let Some(index) = clips.iter().position(|clip| clip.path == selected) else {
+            let Some(index) = clips.iter().position(|clip| clip.id == selected) else {
                 return;
             };
             let old = clips[index].clone();
@@ -1747,7 +2180,7 @@ fn configure_editor(
             if let Some(clip) = ui
                 .get_clips()
                 .iter()
-                .find(|clip| clip.path == ui.get_selected_clip())
+                .find(|clip| clip.id == ui.get_selected_clip_id())
             {
                 apply_clip_preview_settings(&player, &clip, &tracks);
             }
@@ -1778,7 +2211,7 @@ fn configure_editor(
             if let Some(clip) = ui
                 .get_clips()
                 .iter()
-                .find(|clip| clip.path == ui.get_selected_clip())
+                .find(|clip| clip.id == ui.get_selected_clip_id())
             {
                 apply_clip_preview_settings(&player, &clip, &audio_track_settings(&ui));
                 ui.set_edit_trim_in(clip.source_in_seconds);
@@ -1821,7 +2254,7 @@ fn configure_editor(
             if let Some(clip) = ui
                 .get_clips()
                 .iter()
-                .find(|clip| clip.path == ui.get_selected_clip())
+                .find(|clip| clip.id == ui.get_selected_clip_id())
             {
                 apply_clip_preview_settings(&player, &clip, &audio_track_settings(&ui));
                 ui.set_edit_trim_in(clip.source_in_seconds);
@@ -1862,7 +2295,7 @@ fn configure_editor(
                 return;
             };
             let mut clips: Vec<Clip> = ui.get_clips().iter().collect();
-            let Some(clip) = clips.iter_mut().find(|clip| clip.path == path) else {
+            let Some(clip) = clips.iter_mut().find(|clip| clip.id == path) else {
                 return;
             };
             clip.start_seconds = start_seconds.max(0.0);
@@ -1875,6 +2308,7 @@ fn configure_editor(
             ui.set_timeline_duration(end);
             ui.set_clips(Rc::new(slint::VecModel::from(clips)).into());
             ui.set_selected_clip(moved.path.clone());
+            ui.set_selected_clip_id(moved.id.clone());
             file_ready.set(false);
             pending_local.set(Some(moved.source_in_seconds as f64));
             pending_seek.set(Some(moved.start_seconds));
@@ -1966,11 +2400,11 @@ fn configure_editor(
             let Some(ui) = weak.upgrade() else {
                 return;
             };
-            let selected = ui.get_selected_clip().to_string();
+            let selected = ui.get_selected_clip_id().to_string();
             let Some(clip) = ui
                 .get_clips()
                 .iter()
-                .find(|clip| clip.path == selected && clip.track <= 1)
+                .find(|clip| clip.id == selected && clip.track <= 1)
             else {
                 ui.set_status_message("Select a video clip before seeking".into());
                 return;
@@ -2025,6 +2459,7 @@ fn configure_editor(
                 let _ = player.engine.set_paused(true);
                 ui.set_is_playing(false);
                 ui.set_selected_clip("".into());
+                ui.set_selected_clip_id("".into());
                 ui.set_video_frame(Image::default());
                 ui.set_has_video_frame(false);
                 ui.set_timeline_playhead_seconds(target);
@@ -2055,6 +2490,7 @@ fn configure_editor(
             match result {
                 Ok(()) => {
                     ui.set_selected_clip(clip.path.clone());
+                    ui.set_selected_clip_id(clip.id.clone());
                     ui.set_playhead_seconds(local_time as f32);
                     ui.set_timeline_playhead_seconds(target);
                     pending_seek.set(Some(target));
@@ -2281,7 +2717,7 @@ fn configure_editor(
                 return;
             };
 
-            let selected = ui.get_selected_clip().to_string();
+            let selected = ui.get_selected_clip_id().to_string();
 
             if selected.is_empty() {
                 ui.set_status_message("No clip selected".into());
@@ -2294,7 +2730,7 @@ fn configure_editor(
                 undo.borrow_mut().remove(0);
             }
             redo.borrow_mut().clear();
-            clips.retain(|clip| clip.path != selected);
+            clips.retain(|clip| clip.id != selected);
             let start = clips
                 .iter()
                 .map(|clip| clip.start_seconds + clip.duration_seconds)
@@ -2303,6 +2739,7 @@ fn configure_editor(
             ui.set_clips(Rc::new(slint::VecModel::from(clips)).into());
             ui.set_timeline_duration(if start > 0.0 { start } else { 10.0 });
             ui.set_selected_clip("".into());
+            ui.set_selected_clip_id("".into());
             ui.set_video_frame(Image::default());
             ui.set_has_video_frame(false);
             ui.set_playhead_seconds(0.0);
@@ -2592,27 +3029,27 @@ fn open_editor(
             last_playhead_text = playhead_text;
         }
 
-        let selected_path = ui.get_selected_clip().to_string();
-        if selected_path != last_selected_path {
+        let selected_id = ui.get_selected_clip_id().to_string();
+        if selected_id != last_selected_path {
             last_duration = None;
             selected_start_cache = ui
                 .get_clips()
                 .iter()
-                .find(|clip| clip.path == selected_path)
+                .find(|clip| clip.id == selected_id)
                 .map(|clip| clip.start_seconds)
                 .unwrap_or(0.0);
             selected_source_in_cache = ui
                 .get_clips()
                 .iter()
-                .find(|clip| clip.path == selected_path)
+                .find(|clip| clip.id == selected_id)
                 .map(|clip| clip.source_in_seconds)
                 .unwrap_or(0.0);
-            last_selected_path = selected_path;
+            last_selected_path = selected_id;
         }
         if let Some(selected) = ui
             .get_clips()
             .iter()
-            .find(|clip| clip.path == last_selected_path)
+            .find(|clip| clip.id == last_selected_path)
         {
             selected_start_cache = selected.start_seconds;
             selected_source_in_cache = selected.source_in_seconds;
@@ -2626,8 +3063,8 @@ fn open_editor(
         {
             ui.set_video_duration(duration as f32);
             ui.set_video_duration_time(format_time(duration).into());
-            let selected = ui.get_selected_clip().to_string();
-            let selected_clip = ui.get_clips().iter().find(|clip| clip.path == selected);
+            let selected = ui.get_selected_clip_id().to_string();
+            let selected_clip = ui.get_clips().iter().find(|clip| clip.id == selected);
             if let Some(clip) = selected_clip {
                 ui.set_edit_trim_out(clip.source_out_seconds.min(duration as f32));
             }
@@ -2657,7 +3094,7 @@ fn open_editor(
                 .min_by_key(|clip| clip.track)
                 .cloned();
             if let Some(next_clip) = active_video
-                && next_clip.path.as_str() != ui.get_selected_clip().as_str()
+                && next_clip.id.as_str() != ui.get_selected_clip_id().as_str()
             {
                 let local_time = next_clip.source_in_seconds
                     + (actual_timeline_position - next_clip.start_seconds).max(0.0);
@@ -2668,6 +3105,7 @@ fn open_editor(
                 pending_seek.set(Some(actual_timeline_position));
                 if frame_player.load(next_clip.path.as_str()).is_ok() {
                     ui.set_selected_clip(next_clip.path.clone());
+                    ui.set_selected_clip_id(next_clip.id.clone());
                     apply_clip_preview_settings(
                         &frame_player,
                         &next_clip,
@@ -3091,6 +3529,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn one_media_asset_can_create_distinct_timeline_instances() {
+        let asset = MediaAsset {
+            id: "asset-one".into(),
+            name: "source.mp4".into(),
+            path: "/media/source.mp4".into(),
+            bin: "Footage".into(),
+            duration: "00:00:12.000".into(),
+            duration_seconds: 12.0,
+            track: 1,
+            thumbnail_a: Image::default(),
+            thumbnail_b: Image::default(),
+            thumbnail_c: Image::default(),
+            waveform: Image::default(),
+            color: slint::Color::from_rgb_u8(55, 91, 135),
+        };
+        let first = timeline_clip_from_asset(&asset, 0.0);
+        let second = timeline_clip_from_asset(&asset, 12.0);
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.path, second.path);
+        assert_eq!(first.start_seconds, 0.0);
+        assert_eq!(second.start_seconds, 12.0);
+    }
+
+    #[test]
     fn missing_project_uses_interrupted_save_backup() {
         let directory =
             std::env::temp_dir().join(format!("videopro-recovery-test-{}", std::process::id()));
@@ -3201,6 +3663,18 @@ mod tests {
                 scale_end: 1.0,
             },
         ];
+        let assets = [ProjectMediaData {
+            name: "Unused source.mov".to_owned(),
+            source_path: second_media_path.to_string_lossy().into_owned(),
+            duration_seconds: 5.0,
+            bin: "Footage".to_owned(),
+        }];
+        let bins = vec![
+            "All Media".to_owned(),
+            "Unsorted".to_owned(),
+            "Footage".to_owned(),
+            "Empty Bin".to_owned(),
+        ];
         let tracks = [
             AudioTrackSettings::default(),
             AudioTrackSettings {
@@ -3215,7 +3689,15 @@ mod tests {
             },
             AudioTrackSettings::default(),
         ];
-        save_project_bundle(&bundle_path, "Test Project", &clips, &tracks).expect("save bundle");
+        save_project_bundle(
+            &bundle_path,
+            "Test Project",
+            &clips,
+            &assets,
+            &bins,
+            &tracks,
+        )
+        .expect("save bundle");
 
         let file = fs::File::open(&bundle_path).expect("open saved bundle");
         let mut archive = ZipArchive::new(file).expect("bundle is a ZIP archive");
@@ -3225,7 +3707,8 @@ mod tests {
             .expect("manifest exists")
             .read_to_string(&mut manifest)
             .expect("read manifest");
-        assert!(manifest.starts_with("VIDEOPRO_BUNDLE\t7\nNAME\t"));
+        assert!(manifest.starts_with("VIDEOPRO_BUNDLE\t8\nNAME\t"));
+        assert!(manifest.contains("ASSET\t556e7573656420736f757263652e6d6f76\t"));
         assert!(manifest.contains("TRACK\t1\t-4.500000\t1\t0\n"));
         assert!(manifest.contains("TRACK\t2\t3.000000\t0\t1\n"));
         assert!(manifest.contains("\t12.500000\t3.000000\t0.500000\t13.000000\t1\t12.000000\t1.100000\t0.900000\t0.800000\t0.250000\t0.750000\t-3.000000\t2.000000\t0.000000\t4f70656e696e67207469746c65\t1.250000\t12.000000\t1\t1.750000\n"));
@@ -3247,13 +3730,29 @@ mod tests {
             .read_to_end(&mut second_media)
             .expect("read second embedded media");
         assert_eq!(second_media, b"second-media-payload");
+        let mut unused_media = Vec::new();
+        archive
+            .by_name("media/asset-000000.mov")
+            .expect("unused media asset is embedded")
+            .read_to_end(&mut unused_media)
+            .expect("read unused media asset");
+        assert_eq!(unused_media, b"second-media-payload");
         drop(archive);
 
         let extraction_root = directory.join("extracted");
-        let (loaded_name, loaded_clips, loaded_tracks) =
+        let (loaded_name, loaded_clips, loaded_assets, loaded_bins, loaded_tracks) =
             load_project_bundle_into(&bundle_path, &extraction_root).expect("load bundle");
         assert_eq!(loaded_name, "Test Project");
         assert_eq!(loaded_clips.len(), 2);
+        assert_eq!(loaded_assets.len(), 1);
+        assert_eq!(loaded_assets[0].name, "Unused source.mov");
+        assert_eq!(loaded_assets[0].bin, "Footage");
+        assert!(loaded_bins.contains(&"Empty Bin".to_owned()));
+        assert_eq!(
+            fs::read(&loaded_assets[0].source_path).unwrap(),
+            b"second-media-payload"
+        );
+        assert_eq!(loaded_clips[1].source_path, loaded_assets[0].source_path);
         assert_eq!(loaded_clips[0].title_text, "Opening title");
         assert_eq!(loaded_clips[1].title_text, "");
         assert_eq!(loaded_clips[0].audio_gain_db, -3.0);
