@@ -428,6 +428,8 @@ export component EditorWindow inherits Window {
     in-out property <string> video-duration-time: "--:--";
     in-out property <float> timeline-duration: 10;
     in-out property <[Clip]> clips: [];
+    in-out property <[Clip]> filtered-media: [];
+    in-out property <string> media-search: "";
     in-out property <[WorkspaceLayout]> custom-layouts: [];
     in-out property <string> layout-name: "My Layout";
     in-out property <string> selected-clip: "";
@@ -507,6 +509,8 @@ export component EditorWindow inherits Window {
     callback save-project();
     callback open-project();
     callback import-media();
+    callback relink-media();
+    callback filter-media(string);
     callback toggle-playback();
     callback export-project();
     callback save-layout(string);
@@ -525,6 +529,9 @@ export component EditorWindow inherits Window {
     callback finish-move-clip();
     callback undo-edit();
     callback redo-edit();
+
+    changed media-search => { root.filter-media(root.media-search); }
+    changed clips => { root.filter-media(root.media-search); }
 
     callback close-window();
     callback minimize-window();
@@ -1103,6 +1110,19 @@ export component EditorWindow inherits Window {
                         }
 
                         Rectangle {
+                            height: 42px;
+                            background: Theme.panel;
+                            HorizontalLayout {
+                                padding-left: 9px;
+                                padding-right: 9px;
+                                LineEdit {
+                                    text <=> root.media-search;
+                                    placeholder-text: "Search media by name or path";
+                                }
+                            }
+                        }
+
+                        Rectangle {
                             vertical-stretch: 1;
                             background: Theme.bg;
 
@@ -1110,7 +1130,7 @@ export component EditorWindow inherits Window {
                                 VerticalLayout {
                                     spacing: 0px;
 
-                                    for clip in root.clips: Rectangle {
+                                    for clip in root.filtered-media: Rectangle {
                                         height: 58px;
                                         background: root.selected-clip == clip.path ? #263b54 : Theme.bg;
 
@@ -1144,7 +1164,7 @@ export component EditorWindow inherits Window {
                                                 }
 
                                                 Text {
-                                                    text: "VIDEO  ·  " + clip.duration;
+                                                    text: "MEDIA  ·  " + clip.duration;
                                                     color: Theme.muted;
                                                     font-size: 13px;
                                                 }
@@ -1159,8 +1179,8 @@ export component EditorWindow inherits Window {
                                         }
                                     }
 
-                                    if root.clips.length == 0: Text {
-                                        text: "No media imported";
+                                    if root.filtered-media.length == 0: Text {
+                                        text: root.clips.length == 0 ? "No media imported" : "No media matches this search";
                                         color: Theme.muted;
                                         font-size: 13px;
                                     }
@@ -1169,6 +1189,13 @@ export component EditorWindow inherits Window {
                         }
 
                         Divider { }
+
+                        FlatButton {
+                            label: "Relink selected media…";
+                            quiet: true;
+                            enabled: root.selected-clip != "";
+                            clicked => { root.relink-media(); }
+                        }
 
                         FlatButton {
                             label: "+ Import media";

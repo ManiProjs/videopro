@@ -9,7 +9,7 @@ use player::VideoPlayer;
 use slint::{Image, Model, Timer, TimerMode, wgpu_30};
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     fs,
     hash::{Hash, Hasher},
     io::{Read, Write},
@@ -1325,6 +1325,19 @@ fn configure_editor(
             let Some(ui) = weak.upgrade() else {
                 return;
             };
+            let mut seen_paths: HashSet<String> = ui
+                .get_clips()
+                .iter()
+                .map(|clip| media_path_identity(Path::new(clip.path.as_str())))
+                .collect();
+            let files: Vec<PathBuf> = files
+                .into_iter()
+                .filter(|path| seen_paths.insert(media_path_identity(path)))
+                .collect();
+            if files.is_empty() {
+                ui.set_status_message("All selected files are already in the media library".into());
+                return;
+            }
             let base_index = ui.get_clips().row_count();
             let import_generation = generation.load(Ordering::Acquire);
             ui.set_status_message(format!("Analyzing {} file(s)…", files.len()).into());
@@ -1454,6 +1467,77 @@ fn configure_editor(
                     );
                 });
             });
+        }
+    });
+
+    editor.on_relink_media({
+        let weak = editor.as_weak();
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let selected_path = ui.get_selected_clip().to_string();
+            if selected_path.is_empty() {
+                ui.set_status_message("Select a media item to relink first".into());
+                return;
+            }
+            let Some(replacement) = rfd::FileDialog::new()
+                .set_title("Relink Missing Media")
+                .add_filter(
+                    "Video and audio",
+                    &[
+                        "mp4", "mov", "m4v", "mkv", "webm", "avi", "mpeg", "mpg", "mts", "m2ts",
+                        "ts", "flv", "ogv", "3gp", "mp3", "wav", "m4a", "aac", "flac", "ogg",
+                        "opus", "aiff", "wma",
+                    ],
+                )
+                .pick_file()
+            else {
+                return;
+            };
+            let replacement = fs::canonicalize(&replacement).unwrap_or(replacement);
+            let replacement_string = replacement.to_string_lossy().into_owned();
+            let replacement_name = replacement
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Media")
+                .to_owned();
+            let mut clips: Vec<Clip> = ui.get_clips().iter().collect();
+            let mut changed = false;
+            for clip in &mut clips {
+                if clip.path.as_str() == selected_path {
+                    clip.path = replacement_string.clone().into();
+                    clip.name = replacement_name.clone().into();
+                    changed = true;
+                }
+            }
+            if !changed {
+                ui.set_status_message("The selected media item is no longer in the project".into());
+                return;
+            }
+            ui.set_clips(Rc::new(slint::VecModel::from(clips)).into());
+            ui.set_selected_clip(replacement_string.into());
+            ui.set_status_message(format!("Relinked media to {replacement_name}").into());
+        }
+    });
+
+    editor.on_filter_media({
+        let weak = editor.as_weak();
+        move |query| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let query = query.to_string().trim().to_lowercase();
+            let filtered: Vec<Clip> = ui
+                .get_clips()
+                .iter()
+                .filter(|clip| {
+                    query.is_empty()
+                        || clip.name.to_string().to_lowercase().contains(&query)
+                        || clip.path.to_string().to_lowercase().contains(&query)
+                })
+                .collect();
+            ui.set_filtered_media(Rc::new(slint::VecModel::from(filtered)).into());
         }
     });
 
@@ -2280,6 +2364,13 @@ fn pick_media_files() -> Option<Vec<std::path::PathBuf>> {
         )
         .add_filter("All files", &["*"])
         .pick_files()
+}
+
+fn media_path_identity(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn open_editor(
